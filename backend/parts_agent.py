@@ -33,11 +33,12 @@ def search_part(year: str, make: str, model: str, description: str) -> list[dict
     ]
 
     all_results = []
-    for q in queries:
-        try:
-            all_results += DDGS().text(q, max_results=5)
-        except Exception:
-            pass
+    with DDGS() as ddgs:
+        for q in queries:
+            try:
+                all_results += ddgs.text(q, max_results=5)
+            except Exception:
+                pass
 
     return [r for r in all_results if "autozone.com" in r.get("href", "")]
 

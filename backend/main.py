@@ -3,17 +3,18 @@ import json
 import os
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from schemas import VoiceCommandRequest, BayStatus, AgentStatus, ShopConfig
-from llm_parser import parse_voice_transcript
+from schemas import ChatRequest, ChatMessage, BayStatus, AgentStatus, ShopConfig, MechanicIntent
 from parts_agent import lookup_parts
 from billing import calculate_billing
 from browser_agent import run_browser_checkout
+from chat_agent import process_chat_message
 
 load_dotenv()
 
@@ -43,18 +44,38 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-async def recalculate_and_broadcast_billing(bay_id: str):
+async def recalculate_billing(bay_id: str):
     bay = bays[bay_id]
     bay.billing = calculate_billing(bay.all_items, bay.all_results, shop_config)
-    await manager.broadcast({
-        "type": "billing_update",
-        "bay": bay_id,
-        "billing": bay.billing.model_dump(),
-    })
+
+
+async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
+    """Shared pipeline: update bay state, search parts, recalc billing. Returns search results."""
+    bay = bays[bay_id]
+
+    if intent.vehicle.year != "N/A" and intent.vehicle.make != "N/A":
+        bay.vehicle = intent.vehicle
+    if intent.technician_name != "Unknown":
+        bay.technician_name = intent.technician_name
+
+    bay.items = intent.items
+    bay.all_items.extend(intent.items)
+
+    has_parts = any(i.item_type == "PART" for i in intent.items)
+    search_results = {"results": [], "summary": ""}
+
+    if has_parts:
+        bay.logs.append("Searching AutoZone...")
+        search_results = await lookup_parts(intent)
+        bay.results = search_results
+        if search_results.get("results"):
+            bay.all_results.extend(search_results["results"])
+
+    await recalculate_billing(bay_id)
+    return search_results
 
 
 def start_browser_thread(intent, search_results, bay_id):
-    """Run browser checkout in a separate thread with its own event loop."""
     def _run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -62,9 +83,7 @@ def start_browser_thread(intent, search_results, bay_id):
             loop.run_until_complete(_browser_work(intent, search_results, bay_id))
         finally:
             loop.close()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    threading.Thread(target=_run, daemon=True).start()
 
 
 async def _browser_work(intent, search_results, bay_id):
@@ -77,10 +96,8 @@ async def _browser_work(intent, search_results, bay_id):
 
     try:
         bays[bay_id].status = AgentStatus.BROWSING
-
         outcomes = await run_browser_checkout(intent, search_results, log_cb)
 
-        # Update prices from actual cart data — match by index order
         cart_items = outcomes.get("cart_items", [])
         if cart_items:
             part_results = [r for r in bays[bay_id].all_results if r.get("description")]
@@ -89,16 +106,11 @@ async def _browser_work(intent, search_results, bay_id):
                     part_results[i]["price"] = f"${ci['price']:.2f}"
                     if ci.get("part_number"):
                         part_results[i]["part_number"] = ci["part_number"]
-
-            # Recalculate billing with real cart prices
             bays[bay_id].billing = calculate_billing(bays[bay_id].all_items, bays[bay_id].all_results, shop_config)
-            bays[bay_id].logs.append(f"Billing synced with cart: ${bays[bay_id].billing.total:.2f}")
-            print(f"[Browser Bay {bay_id}] Billing updated: ${bays[bay_id].billing.total:.2f}", flush=True)
+            bays[bay_id].logs.append(f"Billing synced: ${bays[bay_id].billing.total:.2f}")
 
         bays[bay_id].status = AgentStatus.COMPLETE
         bays[bay_id].results["browser"] = outcomes
-        print(f"[Browser Bay {bay_id}] Task complete", flush=True)
-
     except Exception as e:
         print(f"[Browser Bay {bay_id}] CRASH: {traceback.format_exc()}", flush=True)
         bays[bay_id].status = AgentStatus.ERROR
@@ -111,7 +123,7 @@ async def lifespan(app: FastAPI):
         bays[str(i)] = BayStatus(bay_number=str(i))
     yield
 
-app = FastAPI(title="BayOps AI", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="BayOps AI", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,7 +141,6 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         return {"error": "ELEVENLABS_API_KEY not set in .env"}
 
     audio_bytes = await audio.read()
-
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             "https://api.elevenlabs.io/v1/speech-to-text",
@@ -140,72 +151,155 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
     if resp.status_code != 200:
         return {"error": f"ElevenLabs error {resp.status_code}: {resp.text}"}
-
     return {"transcript": resp.json().get("text", "")}
 
 
-@app.post("/api/voice-command")
-async def voice_command(req: VoiceCommandRequest):
-    bay_id = req.bay_number or "1"
+@app.post("/api/tts")
+async def text_to_speech(req: dict):
+    """Convert text to speech using ElevenLabs TTS."""
+    from fastapi.responses import Response
+
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    text = req.get("text", "")
+    if not api_key or not text:
+        return Response(content=b"", media_type="audio/mpeg")
+
+    voice_id = "JBFqnCBsd6RMkjVDRZzb"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "text": text,
+                "model_id": "eleven_turbo_v2_5",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+        )
+
+    if resp.status_code != 200:
+        return Response(content=b"", media_type="audio/mpeg")
+
+    return Response(content=resp.content, media_type="audio/mpeg")
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    bay_id = req.bay_number
     if bay_id not in bays:
         bays[bay_id] = BayStatus(bay_number=bay_id)
 
-    bays[bay_id].status = AgentStatus.PARSING
-    bays[bay_id].logs.append(f'Received: "{req.transcript}"')
-    await manager.broadcast({"type": "status_update", "bay": bay_id, "status": "PARSING"})
+    bay = bays[bay_id]
+    now = datetime.now().isoformat()
 
-    # Step 1: Parse
+    # Add user message to history
+    bay.chat_history.append(ChatMessage(role="user", content=req.message, timestamp=now))
+
+    # Call the conversational agent
     try:
-        intent = await parse_voice_transcript(req.transcript)
+        result = await process_chat_message(bay, req.message)
     except Exception as e:
-        bays[bay_id].status = AgentStatus.ERROR
-        return {"status": "error", "message": f"Parse failed: {str(e)}"}
+        reply = f"Sorry, something went wrong: {str(e)}"
+        bay.chat_history.append(ChatMessage(role="assistant", content=reply, timestamp=now))
+        return {"reply": reply, "response_type": "message", "billing": None, "parts_results": None}
 
-    # Keep vehicle from previous command if this is a labor-only update
-    if intent.vehicle.year != "N/A" and intent.vehicle.make != "N/A":
-        bays[bay_id].vehicle = intent.vehicle
-    if intent.technician_name != "Unknown":
-        bays[bay_id].technician_name = intent.technician_name
+    reply = result.get("reply", "")
+    response_type = result.get("response_type", "message")
+    action_data = result.get("action_data")
 
-    bays[bay_id].items = intent.items
-    bays[bay_id].all_items.extend(intent.items)
-    bays[bay_id].logs.append("Parsed successfully.")
-    await manager.broadcast({"type": "parsed", "bay": bay_id, "intent": intent.model_dump()})
+    billing_out = None
+    parts_out = None
 
-    # Step 2: Search for parts (skip if only labor items)
-    has_parts = any(i.item_type == "PART" for i in intent.items)
-    search_results = {"results": [], "summary": ""}
-
-    if has_parts:
-        bays[bay_id].logs.append("Searching AutoZone...")
+    # Execute action if the agent decided to act
+    if response_type == "action" and action_data:
         try:
-            search_results = await lookup_parts(intent)
+            action_type = action_data.get("action", "")
+            items_data = action_data.get("items", [])
+
+            if action_type == "REMOVE_ITEM":
+                remove_desc = items_data[0].get("description", "").lower() if items_data else ""
+                if remove_desc:
+                    before = len(bay.all_items)
+                    bay.all_items = [it for it in bay.all_items if remove_desc not in it.description.lower()]
+                    bay.all_results = [r for r in bay.all_results if remove_desc not in r.get("description", "").lower()]
+                    bay.items = [it for it in bay.items if remove_desc not in it.description.lower()]
+                    removed = before - len(bay.all_items)
+                    await recalculate_billing(bay_id)
+                    if removed > 0:
+                        reply = f"Removed. Total: ${bay.billing.total:.2f}."
+                    else:
+                        reply = f"Couldn't find that item on the estimate."
+
+            elif action_type == "CHECKOUT":
+                # Fill in missing fields from bay state for MechanicIntent
+                if not action_data.get("vehicle") and bay.vehicle:
+                    action_data["vehicle"] = {"year": bay.vehicle.year, "make": bay.vehicle.make, "model": bay.vehicle.model, "vin": None}
+                action_data.setdefault("bay_number", bay_id)
+                action_data.setdefault("technician_name", bay.technician_name or "Unknown")
+                action_data.setdefault("vehicle", {"year": "N/A", "make": "N/A", "model": "N/A", "vin": None})
+                action_data.setdefault("items", [])
+
+                intent = MechanicIntent(**action_data)
+                search_results = bay.results if bay.results.get("results") else {"results": [], "summary": ""}
+                start_browser_thread(intent, search_results, bay_id)
+                bay.logs.append("Browser checkout launched.")
+                reply += f" Opening AutoZone checkout..."
+
+            else:
+                # SOURCE_PARTS / ADD_LABOR — fill missing fields from bay state
+                action_data.setdefault("bay_number", bay_id)
+                action_data.setdefault("technician_name", bay.technician_name or "Unknown")
+                if not action_data.get("vehicle") and bay.vehicle:
+                    action_data["vehicle"] = {"year": bay.vehicle.year, "make": bay.vehicle.make, "model": bay.vehicle.model, "vin": None}
+                action_data.setdefault("vehicle", {"year": "N/A", "make": "N/A", "model": "N/A", "vin": None})
+
+                intent = MechanicIntent(**action_data)
+                search_results = await execute_intent(intent, bay_id)
+                parts_out = search_results
+
+                if search_results.get("results"):
+                    parts_info = ", ".join(
+                        f"{r.get('product_name', r.get('description', ''))} at {r.get('price', 'N/A')}"
+                        for r in search_results["results"]
+                    )
+                    reply += f" Found: {parts_info}."
+
+                if bay.billing.total > 0:
+                    reply += f" Current total: ${bay.billing.total:.2f}."
+
+                # Auto-launch browser to add parts to cart
+                has_parts = any(i.item_type == "PART" for i in intent.items)
+                if has_parts and search_results.get("results"):
+                    start_browser_thread(intent, search_results, bay_id)
+                    reply += " Opening AutoZone to add to cart..."
+
+            billing_out = bay.billing.model_dump()
+            bay.status = AgentStatus.COMPLETE
+
         except Exception as e:
-            bays[bay_id].status = AgentStatus.ERROR
-            return {"status": "error", "message": f"Search failed: {str(e)}", "parsed_intent": intent.model_dump()}
+            reply += f" (Error: {str(e)[:80]})"
+            bay.status = AgentStatus.ERROR
 
-        bays[bay_id].results = search_results
-        if search_results.get("results"):
-            bays[bay_id].all_results.extend(search_results["results"])
-        bays[bay_id].logs.append(search_results.get("summary", "Done."))
-        await manager.broadcast({"type": "search_complete", "bay": bay_id, "results": search_results})
+    # Add assistant reply to history
+    bay.chat_history.append(ChatMessage(
+        role="assistant",
+        content=reply,
+        timestamp=datetime.now().isoformat(),
+        has_action=(response_type == "action"),
+    ))
 
-    # Step 3: Recalculate billing
-    await recalculate_and_broadcast_billing(bay_id)
-    bays[bay_id].logs.append(f"Billing updated: ${bays[bay_id].billing.total:.2f}")
+    # Trim history to last 20 messages
+    if len(bay.chat_history) > 20:
+        bay.chat_history = bay.chat_history[-20:]
 
-    # Step 4: Auto-launch browser for parts (skip if labor-only)
-    if has_parts and search_results.get("results"):
-        start_browser_thread(intent, search_results, bay_id)
-
-    bays[bay_id].status = AgentStatus.COMPLETE if not has_parts else bays[bay_id].status
+    if billing_out:
+        await manager.broadcast({"type": "billing_update", "bay": bay_id, "billing": billing_out})
 
     return {
-        "status": "ok",
-        "bay": bay_id,
-        "parsed_intent": intent.model_dump(),
-        "parts_results": search_results,
-        "billing": bays[bay_id].billing.model_dump(),
+        "reply": reply,
+        "response_type": response_type,
+        "billing": billing_out,
+        "parts_results": parts_out,
     }
 
 

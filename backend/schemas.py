@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from enum import Enum
@@ -67,6 +68,18 @@ class BayBilling(BaseModel):
     total: float = 0.0
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    has_action: bool = False
+
+
+class ChatRequest(BaseModel):
+    message: str
+    bay_number: str = "1"
+
+
 class BayStatus(BaseModel):
     bay_number: str
     status: AgentStatus = AgentStatus.IDLE
@@ -78,3 +91,4 @@ class BayStatus(BaseModel):
     results: dict = {}
     all_results: List[dict] = []
     billing: BayBilling = BayBilling()
+    chat_history: List[ChatMessage] = []
