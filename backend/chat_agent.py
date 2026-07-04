@@ -3,73 +3,99 @@ import os
 from groq import AsyncGroq
 from schemas import ChatMessage, BayStatus
 
-SYSTEM_PROMPT = """You are BayOps AI, a service advisor at an automotive repair shop. You have a conversation with a mechanic about what they need.
+SYSTEM_PROMPT = """You are BayOps AI, a service advisor at an automotive repair shop.
 
-Your job:
-1. Gather: vehicle (year/make/model), bay number, and which parts or labor are needed
-2. If any critical info is missing (especially vehicle), ask for it — keep it short
-3. When you have enough info to search for parts, do it
-4. After finding parts or adding labor, report the result and ask if anything else is needed
-5. When user confirms adding to cart, proceed with checkout
+REQUIRED FIELDS — you MUST collect ALL of these before taking any action:
+1. Technician name (first name is fine)
+2. Bay number (which bay they are working in)
+3. Vehicle YEAR (e.g. 2019)
+4. Vehicle MAKE (brand, e.g. Honda)
+5. Vehicle MODEL (e.g. Civic)
+6. Part or labor description AND quantity (how many of each item)
 
-Rules:
+DO NOT search for parts or take any action until ALL 6 fields above are confirmed.
+Ask for missing fields one or two at a time — keep it conversational and short.
+
+Conversation flow:
+- If name is missing → ask for it first
+- If bay number is missing → ask for it
+- If vehicle info is incomplete → ask for year, make, or model
+- If quantity is not specified → ask "How many do you need?"
+- Once ALL fields are collected → proceed with the action
+
+Other rules:
 - Keep responses SHORT — 1-2 sentences max. This is voice-driven.
-- Bay number can default to the current bay if not specified
-- Technician name defaults to "Unknown" — don't ask for it
 - If user says "yes", "go ahead", "do it" — that's confirmation to proceed
-- For labor: extract hours. Default to 1 hour if not specified.
-- Always be helpful and conversational, like a real service advisor
+- For labor: extract hours. Ask if not specified.
+- Always be helpful and conversational
 
 You MUST respond with ONLY valid JSON:
 {
   "response_type": "question" | "action" | "message",
   "reply": "Your short response to the mechanic",
+  "missing_fields": ["name", "bay", "year", "make", "model", "quantity"],
   "action_data": null | {
     "bay_number": "string",
     "technician_name": "string",
     "vehicle": {"year": "string", "make": "string", "model": "string", "vin": null},
     "items": [{"item_type": "PART|LABOR", "description": "string", "quantity": 1.0, "vendor": null, "hours": null}],
-    "action": "SOURCE_PARTS | ADD_LABOR | CHECKOUT | REMOVE_ITEM"
+    "action": "SOURCE_PARTS | ADD_LABOR | CHECKOUT | REMOVE_ITEM | EDIT_ITEM"
   }
 }
 
 response_type meanings:
-- "question": You need more info from the mechanic. action_data must be null.
-- "action": You have enough info to act. action_data must contain the intent.
-- "message": Informational reply (e.g., reporting totals, acknowledging). action_data must be null.
+- "question": One or more required fields are still missing. action_data MUST be null.
+- "action": ALL required fields are confirmed. action_data must contain the full intent.
+- "message": Informational reply only. action_data must be null.
+
+missing_fields: list which of the 6 required fields are still unknown. Empty list [] when all are known.
 
 action meanings:
-- "SOURCE_PARTS": Search for parts (first time mentioning parts)
-- "ADD_LABOR": Add labor hours only
-- "CHECKOUT": User confirmed, add parts to cart and go to checkout
-- "REMOVE_ITEM": Remove an item from the estimate. Put the item description in items[0].description."""
+- "SOURCE_PARTS": Search for parts across vendors and compare prices
+- "ADD_LABOR": Add labor hours to the estimate
+- "CHECKOUT": User confirmed, open browser to add to cart
+- "REMOVE_ITEM": Remove an item. Put description in items[0].description.
+- "EDIT_ITEM": Change the quantity of an existing item. Put description in items[0].description, new quantity in items[0].quantity. Use when user says "change X to 2", "update quantity of X", "I need 3 of X instead"."""
 
 
 def build_bay_context(bay: BayStatus) -> str:
-    parts = []
-    parts.append(f"Bay: {bay.bay_number}")
-    if bay.vehicle and bay.vehicle.year != "N/A":
-        parts.append(f"Vehicle: {bay.vehicle.year} {bay.vehicle.make} {bay.vehicle.model}")
-    else:
-        parts.append("Vehicle: Not set yet")
-    if bay.technician_name and bay.technician_name != "Unknown":
-        parts.append(f"Technician: {bay.technician_name}")
+    lines = []
+
+    # --- Required fields status ---
+    has_name = bay.technician_name and bay.technician_name != "Unknown"
+    veh = bay.vehicle
+    has_year  = veh and veh.year  not in (None, "", "N/A")
+    has_make  = veh and veh.make  not in (None, "", "N/A")
+    has_model = veh and veh.model not in (None, "", "N/A")
+
+    lines.append("REQUIRED FIELDS STATUS:")
+    name_status = f'"{bay.technician_name}" (CONFIRMED)' if has_name else "MISSING - must ask"
+    year_status  = f'"{veh.year}"  (CONFIRMED)' if has_year  else "MISSING - must ask"
+    make_status  = f'"{veh.make}"  (CONFIRMED)' if has_make  else "MISSING - must ask"
+    model_status = f'"{veh.model}" (CONFIRMED)' if has_model else "MISSING - must ask"
+    lines.append(f"- Technician name: {name_status}")
+    lines.append(f"- Bay number: {bay.bay_number} (CONFIRMED)")
+    lines.append(f"- Vehicle year:  {year_status}")
+    lines.append(f"- Vehicle make:  {make_status}")
+    lines.append(f"- Vehicle model: {model_status}")
 
     if bay.all_items:
-        items_str = ", ".join(
-            f"{it.description} ({'$' + str(round(it.quantity * 150, 2)) if it.item_type == 'LABOR' else it.description})"
-            for it in bay.all_items
-        )
-        parts.append(f"Items on estimate: {items_str}")
+        lines.append("\nItems on estimate (quantities confirmed):")
+        for it in bay.all_items:
+            qty = f"{it.quantity:.0f}x" if it.quantity != 1 else ""
+            lines.append(f"  - {qty} {it.description} ({it.item_type})")
+    else:
+        lines.append("\nItems: none yet — must ask what part/service is needed and quantity")
 
     if bay.billing and bay.billing.total > 0:
-        parts.append(f"Current total: ${bay.billing.total:.2f}")
+        lines.append(f"\nCurrent estimate total: ${bay.billing.total:.2f}")
 
     if bay.results and bay.results.get("results"):
+        lines.append("\nParts already found:")
         for r in bay.results["results"]:
-            parts.append(f"Found: {r.get('product_name', '')} at {r.get('price', 'N/A')} from {r.get('vendor', '')}")
+            lines.append(f"  - {r.get('description', '')} → {r.get('product_name', '')} at {r.get('price', 'N/A')} ({r.get('vendor', '')})")
 
-    return "Current bay state:\n" + "\n".join(f"- {p}" for p in parts)
+    return "\n".join(lines)
 
 
 async def process_chat_message(

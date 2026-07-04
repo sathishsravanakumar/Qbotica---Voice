@@ -18,6 +18,9 @@ export default function App() {
   const [status, setStatus] = useState(null);
   const [voiceOn, setVoiceOn] = useState(true);
   const [isRecording, setIsRecording] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState(null);
+  const [cartVerification, setCartVerification] = useState(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const wsRef = useRef(null);
   const mrRef = useRef(null);
@@ -54,10 +57,11 @@ export default function App() {
           else if (d.type === "parsed") { u.vehicle = d.intent.vehicle; u.technician_name = d.intent.technician_name; u.items = d.intent.items; }
           else if (d.type === "search_complete") u.results = d.results;
           else if (d.type === "billing_update") u.billing = d.billing;
-          else if (d.type === "bay_cleared") { if (id === sel) setChatMessages([]); return { ...p, [id]: { bay_number: id, status: "IDLE", vehicle: null, technician_name: null, items: [], logs: [], results: {}, billing: null, chat_history: [] } }; }
+          else if (d.type === "bay_cleared") { if (id === sel) { setChatMessages([]); setCartVerification(null); } return { ...p, [id]: { bay_number: id, status: "IDLE", vehicle: null, technician_name: null, items: [], logs: [], results: {}, billing: null, chat_history: [] } }; }
           else if (d.type === "agent_log") u.logs = [...u.logs, d.message];
           else if (d.type === "agent_complete") { u.status = d.status; u.results = d.results; }
           else if (d.type === "agent_error") { u.status = d.status; u.logs = [...u.logs, d.error]; }
+          else if (d.type === "cart_verified" && id === sel) { setCartVerification(d); }
           return { ...p, [id]: u };
         });
       };
@@ -171,6 +175,47 @@ export default function App() {
     } catch { /* mic error */ }
   }, [isRecording, sel, voiceOn, sending]);
 
+  async function removeItem(description) {
+    try {
+      await fetch(`${API}/bays/${sel}/remove-item`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description }),
+      });
+    } catch {}
+  }
+
+  async function editQuantity(description, quantity) {
+    try {
+      await fetch(`${API}/bays/${sel}/edit-item`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description, quantity }),
+      });
+    } catch {}
+  }
+
+  async function exportToExcel() {
+    setExporting(true);
+    setExportStatus(null);
+    try {
+      const r = await fetch(`${API}/bays/${sel}/export-excel`, { method: "POST" });
+      const d = await r.json();
+      if (d.status === "ok") {
+        setExportStatus(`Saved: ${d.filename}`);
+        setTimeout(() => setExportStatus(null), 6000);
+      } else {
+        setExportStatus("Export failed");
+        setTimeout(() => setExportStatus(null), 4000);
+      }
+    } catch {
+      setExportStatus("Export failed");
+      setTimeout(() => setExportStatus(null), 4000);
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function handleFileUpload(e) {
     const file = e.target.files?.[0];
     e.target.value = "";
@@ -278,26 +323,98 @@ export default function App() {
             <div className="grid lg:grid-cols-2 gap-4 animate-fade">
               {bay.results?.results?.length > 0 && (
                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-                  <div className="px-5 py-2.5 border-b border-slate-100">
+                  <div className="px-4 py-2.5 border-b border-slate-100 flex items-center justify-between">
                     <span className="text-[11px] uppercase tracking-widest font-bold text-slate-400">Parts Found</span>
+                    <span className="text-[9px] text-slate-400">Cheapest auto-selected</span>
                   </div>
                   <div className="divide-y divide-slate-100">
                     {bay.results.results.map((p, i) => (
-                      <div key={i} className="px-5 py-3 flex items-start justify-between gap-3">
-                        <div className="min-w-0 flex-1">
-                          <p className="text-[13px] font-medium text-slate-900 truncate">{p.product_name}</p>
-                          <div className="flex items-center gap-2 mt-1">
-                            <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${p.in_stock ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-600"}`}>{p.in_stock ? "In Stock" : "Out"}</span>
-                            {p.source_url && <a href={p.source_url} target="_blank" rel="noopener noreferrer" className="text-[10px] text-blue-500 hover:underline flex items-center gap-0.5">View <ArrowUpRight className="w-2.5 h-2.5" /></a>}
-                          </div>
+                      <div key={i} className="px-4 py-3">
+                        {/* Part description */}
+                        <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-2 capitalize">{p.description}</p>
+                        {/* Vendor comparison rows */}
+                        <div className="space-y-1">
+                          {(p.vendor_options?.length > 0 ? p.vendor_options : [{
+                            vendor: p.vendor, price: p.price, product_name: p.product_name,
+                            source_url: p.source_url, in_stock: p.in_stock, part_number: p.part_number,
+                          }]).map((opt, vi) => {
+                            const isSelected = opt.vendor === p.vendor;
+                            const [switching, setSwitching] = [false, () => {}];
+                            return (
+                              <button
+                                key={vi}
+                                onClick={async () => {
+                                  if (isSelected) return;
+                                  try {
+                                    await fetch(`${API}/bays/${sel}/switch-vendor`, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ description: p.description, vendor: opt.vendor }),
+                                    });
+                                  } catch {}
+                                }}
+                                className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-left transition-all cursor-pointer
+                                  ${isSelected
+                                    ? "bg-blue-50 border border-blue-200"
+                                    : "border border-transparent hover:bg-slate-50 hover:border-slate-200"
+                                  }`}
+                              >
+                                <div className="flex items-center gap-2 min-w-0 flex-1">
+                                  {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" />}
+                                  {!isSelected && <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />}
+                                  <span className={`text-[12px] font-medium truncate ${isSelected ? "text-blue-700" : "text-slate-600"}`}>
+                                    {opt.vendor}
+                                  </span>
+                                  <span className={`text-[9px] font-bold uppercase px-1 py-0.5 rounded shrink-0 ${opt.in_stock ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-500"}`}>
+                                    {opt.in_stock ? "In Stock" : "Out"}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <span className={`font-bold text-[13px] ${isSelected ? "text-blue-700" : "text-slate-700"}`}>
+                                    {String(opt.price).startsWith("$") ? opt.price : opt.price === "See website" ? "—" : `$${opt.price}`}
+                                  </span>
+                                  {opt.source_url && (
+                                    <a
+                                      href={opt.source_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={e => e.stopPropagation()}
+                                      className="text-blue-500 hover:text-blue-700"
+                                    >
+                                      <ArrowUpRight className="w-3 h-3" />
+                                    </a>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
                         </div>
-                        <span className="text-base font-bold text-slate-900">{String(p.price).startsWith("$") ? p.price : `$${p.price}`}</span>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
-              {hasBill && <BillingPanel billing={bay.billing} />}
+              {hasBill && (
+                <div className="flex flex-col gap-2">
+                  <BillingPanel billing={bay.billing} onRemove={removeItem} onEditQty={editQuantity} />
+                  <button
+                    onClick={exportToExcel}
+                    disabled={exporting}
+                    className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-300 text-white text-[13px] font-semibold rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-2 shadow-sm"
+                  >
+                    {exporting ? (
+                      <><span className="w-3.5 h-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" /> Exporting...</>
+                    ) : (
+                      "Export to Excel"
+                    )}
+                  </button>
+                  {exportStatus && (
+                    <p className="text-[11px] text-emerald-700 font-medium text-center bg-emerald-50 rounded-lg py-1.5 px-3">
+                      {exportStatus}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -305,6 +422,36 @@ export default function App() {
           {bay.logs?.length > 0 && (
             <div className="h-[180px]">
               <AgentLog logs={bay.logs} bayNumber={sel} />
+            </div>
+          )}
+
+          {/* Cart Verification */}
+          {cartVerification && cartVerification.bay === sel && (
+            <div className={`rounded-xl border px-4 py-3 text-[13px] animate-fade ${
+              !cartVerification.verified
+                ? "bg-slate-50 border-slate-200 text-slate-500"
+                : cartVerification.mismatch
+                  ? "bg-amber-50 border-amber-200 text-amber-800"
+                  : "bg-emerald-50 border-emerald-200 text-emerald-800"
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className="font-semibold">
+                  {!cartVerification.verified
+                    ? "Cart could not be verified — check cart manually"
+                    : cartVerification.mismatch
+                      ? `⚠ Cart total $${cartVerification.cart_total.toFixed(2)} differs from estimate $${cartVerification.expected_total.toFixed(2)}`
+                      : `✓ Cart verified — ${cartVerification.cart_items.length} item(s), $${cartVerification.cart_total.toFixed(2)}`
+                  }
+                </span>
+                <button onClick={() => setCartVerification(null)} className="ml-4 text-[10px] opacity-50 hover:opacity-100 cursor-pointer">✕</button>
+              </div>
+              {cartVerification.verified && cartVerification.cart_items.length > 0 && (
+                <ul className="mt-2 space-y-0.5 text-[11px] opacity-80">
+                  {cartVerification.cart_items.map((item, i) => (
+                    <li key={i}>{item.name || item.description} {item.part_number && item.part_number !== "N/A" ? `— #${item.part_number}` : ""} ${(item.price || 0).toFixed(2)}</li>
+                  ))}
+                </ul>
+              )}
             </div>
           )}
         </div>

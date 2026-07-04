@@ -42,7 +42,7 @@ class AgentStatus(str, Enum):
 
 class ShopConfig(BaseModel):
     labor_rate: float = 150.0
-    parts_markup_pct: float = 0.45
+    parts_markup_pct: float = 0.25
     tax_rate: float = 0.0825
 
 

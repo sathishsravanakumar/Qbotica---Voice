@@ -7,9 +7,10 @@ from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from pydantic import BaseModel
 from schemas import ChatRequest, ChatMessage, BayStatus, AgentStatus, ShopConfig, MechanicIntent
 from parts_agent import lookup_parts
 from billing import calculate_billing
@@ -20,6 +21,84 @@ load_dotenv()
 
 bays: dict[str, BayStatus] = {}
 shop_config = ShopConfig()
+
+# Maps bay_id → Desktop file path of the currently open Excel workbook.
+# Populated when the user clicks "Export to Excel" for the first time.
+# All subsequent billing changes trigger a live in-place update.
+excel_files: dict[str, str] = {}
+
+
+def _assemble_bay_data(bay: BayStatus) -> dict:
+    """Build the bay_data dict consumed by excel_export functions."""
+    veh = bay.vehicle
+    part_num_map = {
+        r.get("description", "").lower(): r.get("part_number", "N/A")
+        for r in bay.all_results
+    }
+    parts = [
+        {
+            "description": item.description,
+            "vendor": item.source or "—",
+            "part_number": part_num_map.get(item.description.lower(), "N/A"),
+            "quantity": item.quantity,
+            "unit_cost": item.unit_cost,
+            "markup_pct": item.markup_pct * 100,
+            "extended_price": item.extended_price,
+        }
+        for item in (bay.billing.parts_items if bay.billing else [])
+    ]
+    labor = [
+        {
+            "description": item.description,
+            "hours": item.quantity,
+            "rate": item.unit_cost,
+            "extended_price": item.extended_price,
+        }
+        for item in (bay.billing.labor_items if bay.billing else [])
+    ]
+    return {
+        "bay_number": bay.bay_number,
+        "technician_name": bay.technician_name or "—",
+        "vehicle": {"year": veh.year, "make": veh.make, "model": veh.model} if veh else {},
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "parts": parts,
+        "labor": labor,
+        "parts_subtotal": bay.billing.parts_subtotal if bay.billing else 0.0,
+        "labor_subtotal": bay.billing.labor_subtotal if bay.billing else 0.0,
+        "tax_rate": bay.billing.tax_rate if bay.billing else 0.0825,
+        "tax_amount": bay.billing.tax_amount if bay.billing else 0.0,
+        "grand_total": bay.billing.total if bay.billing else 0.0,
+    }
+
+
+def _trigger_excel_update(bay_id: str):
+    """If an Excel file is tracked for this bay, push a live update in the background."""
+    if bay_id not in excel_files:
+        return
+    bay = bays.get(bay_id)
+    if not bay or not bay.billing or bay.billing.total == 0:
+        return
+    file_path = excel_files[bay_id]
+    bay_data = _assemble_bay_data(bay)
+
+    def _run():
+        # Excel COM runs in STA; initialise the apartment for this background thread
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except Exception:
+            pass
+        try:
+            from excel_export import update_excel_live
+            update_excel_live(file_path, bay_data)
+        finally:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class ConnectionManager:
@@ -72,6 +151,7 @@ async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
             bay.all_results.extend(search_results["results"])
 
     await recalculate_billing(bay_id)
+    _trigger_excel_update(bay_id)
     return search_results
 
 
@@ -92,12 +172,55 @@ async def _browser_work(intent, search_results, bay_id):
     async def log_cb(msg: str):
         if bay_id in bays:
             bays[bay_id].logs.append(msg)
-        print(f"[Browser Bay {bay_id}] {msg}", flush=True)
+        try:
+            print(f"[Browser Bay {bay_id}] {msg}", flush=True)
+        except (ValueError, OSError):
+            pass
 
     try:
         bays[bay_id].status = AgentStatus.BROWSING
         outcomes = await run_browser_checkout(intent, search_results, log_cb)
 
+        # Sync real prices scraped from vendor pages back to results
+        vendor_prices = outcomes.get("vendor_prices", {})
+        if vendor_prices:
+            for r in bays[bay_id].all_results:
+                desc = r.get("description", "").lower().strip()
+                matched = next((vp_list for k, vp_list in vendor_prices.items() if k.lower().strip() == desc), None)
+                if matched:
+                    # Update each vendor_option with the real scraped price
+                    for opt in r.get("vendor_options", []):
+                        for vp in matched:
+                            if vp["vendor"] == opt["vendor"] and vp["price"] > 0:
+                                opt["price"] = f"${vp['price']:.2f}"
+                    # Determine cheapest from real prices
+                    priced = sorted([vp for vp in matched if vp["price"] > 0], key=lambda x: x["price"])
+                    if priced:
+                        best = priced[0]
+                        r["price"] = f"${best['price']:.2f}"
+                        r["vendor"] = best["vendor"]
+                        # Update the matching vendor_option as new selected
+                        bays[bay_id].logs.append(
+                            f"Real prices — " + ", ".join(f"{vp['vendor']}: ${vp['price']:.2f}" for vp in priced)
+                        )
+                        bays[bay_id].logs.append(f"Cheapest: {best['vendor']} at ${best['price']:.2f}")
+
+            # Also sync to bay.results display
+            if bays[bay_id].results.get("results"):
+                for r in bays[bay_id].results["results"]:
+                    desc = r.get("description", "").lower().strip()
+                    matched = next((vp_list for k, vp_list in vendor_prices.items() if k.lower().strip() == desc), None)
+                    if matched:
+                        for opt in r.get("vendor_options", []):
+                            for vp in matched:
+                                if vp["vendor"] == opt["vendor"] and vp["price"] > 0:
+                                    opt["price"] = f"${vp['price']:.2f}"
+                        priced = sorted([vp for vp in matched if vp["price"] > 0], key=lambda x: x["price"])
+                        if priced:
+                            r["price"] = f"${priced[0]['price']:.2f}"
+                            r["vendor"] = priced[0]["vendor"]
+
+        # Also sync cart item prices (for AutoZone-specific cart scraping)
         cart_items = outcomes.get("cart_items", [])
         if cart_items:
             part_results = [r for r in bays[bay_id].all_results if r.get("description")]
@@ -106,13 +229,34 @@ async def _browser_work(intent, search_results, bay_id):
                     part_results[i]["price"] = f"${ci['price']:.2f}"
                     if ci.get("part_number"):
                         part_results[i]["part_number"] = ci["part_number"]
-            bays[bay_id].billing = calculate_billing(bays[bay_id].all_items, bays[bay_id].all_results, shop_config)
-            bays[bay_id].logs.append(f"Billing synced: ${bays[bay_id].billing.total:.2f}")
+
+        # Recalculate billing with real prices
+        bays[bay_id].billing = calculate_billing(bays[bay_id].all_items, bays[bay_id].all_results, shop_config)
+        bays[bay_id].logs.append(f"Billing updated with real prices: ${bays[bay_id].billing.total:.2f}")
+        _trigger_excel_update(bay_id)
 
         bays[bay_id].status = AgentStatus.COMPLETE
         bays[bay_id].results["browser"] = outcomes
+
+        # Broadcast cart verification result so the frontend can show a confirmation card
+        cart_items = outcomes.get("cart_items", [])
+        cart_total = outcomes.get("cart_total", 0.0)
+        expected = bays[bay_id].billing.parts_subtotal
+        mismatch = cart_total > 0 and abs(cart_total - expected) > 1.00
+        await manager.broadcast({
+            "type": "cart_verified",
+            "bay": bay_id,
+            "verified": cart_total > 0,
+            "cart_total": cart_total,
+            "expected_total": expected,
+            "mismatch": mismatch,
+            "cart_items": cart_items,
+        })
     except Exception as e:
-        print(f"[Browser Bay {bay_id}] CRASH: {traceback.format_exc()}", flush=True)
+        try:
+            print(f"[Browser Bay {bay_id}] CRASH: {traceback.format_exc()}", flush=True)
+        except (ValueError, OSError):
+            pass
         bays[bay_id].status = AgentStatus.ERROR
         bays[bay_id].logs.append(f"Browser failed: {str(e)}")
 
@@ -220,15 +364,41 @@ async def chat(req: ChatRequest):
                 remove_desc = items_data[0].get("description", "").lower() if items_data else ""
                 if remove_desc:
                     before = len(bay.all_items)
-                    bay.all_items = [it for it in bay.all_items if remove_desc not in it.description.lower()]
-                    bay.all_results = [r for r in bay.all_results if remove_desc not in r.get("description", "").lower()]
-                    bay.items = [it for it in bay.items if remove_desc not in it.description.lower()]
+                    # Exact match first; fall back to substring so "brake pads" ≠ "brake fluid"
+                    exact = [it for it in bay.all_items if it.description.lower() == remove_desc]
+                    if exact:
+                        bay.all_items  = [it for it in bay.all_items  if it.description.lower() != remove_desc]
+                        bay.all_results = [r for r in bay.all_results if r.get("description", "").lower() != remove_desc]
+                        bay.items       = [it for it in bay.items       if it.description.lower() != remove_desc]
+                    else:
+                        bay.all_items  = [it for it in bay.all_items  if remove_desc not in it.description.lower()]
+                        bay.all_results = [r for r in bay.all_results if remove_desc not in r.get("description", "").lower()]
+                        bay.items       = [it for it in bay.items       if remove_desc not in it.description.lower()]
                     removed = before - len(bay.all_items)
                     await recalculate_billing(bay_id)
+                    _trigger_excel_update(bay_id)
                     if removed > 0:
                         reply = f"Removed. Total: ${bay.billing.total:.2f}."
                     else:
-                        reply = f"Couldn't find that item on the estimate."
+                        reply = "Couldn't find that item on the estimate."
+
+            elif action_type == "EDIT_ITEM":
+                edit_desc = items_data[0].get("description", "").lower() if items_data else ""
+                new_qty = float(items_data[0].get("quantity", 1)) if items_data else 1.0
+                if edit_desc:
+                    updated = False
+                    for it in bay.all_items:
+                        if it.description.lower() == edit_desc or edit_desc in it.description.lower():
+                            it.quantity = new_qty
+                            if it.item_type == "LABOR" and it.hours is not None:
+                                it.hours = new_qty
+                            updated = True
+                    await recalculate_billing(bay_id)
+                    _trigger_excel_update(bay_id)
+                    if updated:
+                        reply = f"Updated to {new_qty:.0f}. Total: ${bay.billing.total:.2f}."
+                    else:
+                        reply = "Couldn't find that item on the estimate."
 
             elif action_type == "CHECKOUT":
                 # Fill in missing fields from bay state for MechanicIntent
@@ -315,10 +485,159 @@ async def get_bay_billing(bay_id: str):
     return bays[bay_id].billing.model_dump()
 
 
+class SwitchVendorRequest(BaseModel):
+    description: str
+    vendor: str
+
+
+@app.post("/api/bays/{bay_id}/switch-vendor")
+async def switch_vendor(bay_id: str, req: SwitchVendorRequest):
+    """Switch the selected vendor for a part and recalculate billing."""
+    if bay_id not in bays:
+        return {"error": "Bay not found"}
+
+    bay = bays[bay_id]
+    switched = False
+
+    for r in bay.all_results:
+        if r.get("description", "").lower() != req.description.lower():
+            continue
+        options = r.get("vendor_options", [])
+        chosen = next((o for o in options if o.get("vendor") == req.vendor), None)
+        if not chosen:
+            return {"error": f"Vendor '{req.vendor}' not found for '{req.description}'"}
+
+        # Update top-level fields to the chosen vendor
+        r["product_name"] = chosen.get("product_name", r.get("product_name", ""))
+        r["price"] = chosen.get("price", r.get("price", ""))
+        r["vendor"] = chosen.get("vendor", "")
+        r["source_url"] = chosen.get("source_url", "")
+        r["in_stock"] = chosen.get("in_stock", True)
+        r["part_number"] = chosen.get("part_number", "N/A")
+        r["snippet"] = chosen.get("snippet", "")
+        switched = True
+        break
+
+    # Also update bay.results (latest search display)
+    if bay.results and bay.results.get("results"):
+        for r in bay.results["results"]:
+            if r.get("description", "").lower() != req.description.lower():
+                continue
+            options = r.get("vendor_options", [])
+            chosen = next((o for o in options if o.get("vendor") == req.vendor), None)
+            if chosen:
+                r["product_name"] = chosen.get("product_name", "")
+                r["price"] = chosen.get("price", "")
+                r["vendor"] = chosen.get("vendor", "")
+                r["source_url"] = chosen.get("source_url", "")
+                r["in_stock"] = chosen.get("in_stock", True)
+                r["part_number"] = chosen.get("part_number", "N/A")
+                r["snippet"] = chosen.get("snippet", "")
+            break
+
+    if not switched:
+        return {"error": f"Part '{req.description}' not found in results"}
+
+    # Recalculate billing with new price
+    bay.billing = calculate_billing(bay.all_items, bay.all_results, shop_config)
+    _trigger_excel_update(bay_id)
+
+    await manager.broadcast({
+        "type": "billing_update", "bay": bay_id,
+        "billing": bay.billing.model_dump(),
+    })
+    await manager.broadcast({
+        "type": "search_complete", "bay": bay_id,
+        "results": bay.results,
+    })
+
+    return {"status": "ok", "billing": bay.billing.model_dump()}
+
+
+@app.post("/api/bays/{bay_id}/remove-item")
+async def remove_bay_item(bay_id: str, body: dict):
+    if bay_id not in bays:
+        raise HTTPException(status_code=404, detail="Bay not found")
+    bay = bays[bay_id]
+    desc = body.get("description", "").lower().strip()
+    if not desc:
+        raise HTTPException(status_code=400, detail="description required")
+    before = len(bay.all_items)
+    exact = [it for it in bay.all_items if it.description.lower() == desc]
+    if exact:
+        bay.all_items   = [it for it in bay.all_items   if it.description.lower() != desc]
+        bay.all_results = [r  for r  in bay.all_results if r.get("description", "").lower() != desc]
+        bay.items       = [it for it in bay.items        if it.description.lower() != desc]
+    else:
+        bay.all_items   = [it for it in bay.all_items   if desc not in it.description.lower()]
+        bay.all_results = [r  for r  in bay.all_results if desc not in r.get("description", "").lower()]
+        bay.items       = [it for it in bay.items        if desc not in it.description.lower()]
+    removed = before - len(bay.all_items)
+    await recalculate_billing(bay_id)
+    _trigger_excel_update(bay_id)
+    await manager.broadcast({"type": "billing_update", "bay": bay_id, "billing": bay.billing.model_dump()})
+    return {"status": "ok", "removed": removed, "billing": bay.billing.model_dump()}
+
+
+@app.post("/api/bays/{bay_id}/edit-item")
+async def edit_bay_item(bay_id: str, body: dict):
+    if bay_id not in bays:
+        raise HTTPException(status_code=404, detail="Bay not found")
+    bay = bays[bay_id]
+    desc = body.get("description", "").lower().strip()
+    new_qty = float(body.get("quantity", 1))
+    if not desc:
+        raise HTTPException(status_code=400, detail="description required")
+    updated = False
+    for it in bay.all_items:
+        if it.description.lower() == desc or desc in it.description.lower():
+            it.quantity = new_qty
+            if it.item_type == "LABOR" and it.hours is not None:
+                it.hours = new_qty
+            updated = True
+    await recalculate_billing(bay_id)
+    _trigger_excel_update(bay_id)
+    await manager.broadcast({"type": "billing_update", "bay": bay_id, "billing": bay.billing.model_dump()})
+    return {"status": "ok", "updated": updated, "billing": bay.billing.model_dump()}
+
+
+@app.post("/api/bays/{bay_id}/export-excel")
+async def export_bay_to_excel(bay_id: str):
+    from excel_export import export_order_to_excel, open_in_excel
+
+    if bay_id not in bays:
+        raise HTTPException(status_code=404, detail="Bay not found")
+
+    bay = bays[bay_id]
+    if not bay.billing or bay.billing.total == 0:
+        raise HTTPException(status_code=400, detail="No billing data to export")
+
+    bay_data = _assemble_bay_data(bay)
+
+    # Create the .xlsx file
+    file_path = await asyncio.to_thread(export_order_to_excel, bay_data)
+    filename = os.path.basename(file_path)
+
+    # Register for live updates BEFORE opening so the first update doesn't race
+    excel_files[bay_id] = file_path
+
+    # Open in Excel via xlwings (keeps COM handle alive for live updates)
+    await asyncio.to_thread(open_in_excel, file_path)
+
+    await manager.broadcast({
+        "type": "agent_log",
+        "bay": bay_id,
+        "message": f"Order exported to Desktop: {filename} — live updates enabled",
+    })
+
+    return {"status": "ok", "file_path": file_path, "filename": filename}
+
+
 @app.post("/api/bays/{bay_id}/clear")
 async def clear_bay(bay_id: str):
     if bay_id in bays:
         bays[bay_id] = BayStatus(bay_number=bay_id)
+    excel_files.pop(bay_id, None)   # stop live updates for this bay
     await manager.broadcast({"type": "bay_cleared", "bay": bay_id})
     return {"status": "ok"}
 
