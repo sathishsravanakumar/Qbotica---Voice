@@ -2,12 +2,44 @@ import asyncio
 import base64
 import os
 import re
+import threading
 from typing import Callable, Awaitable
 
 import anthropic
 from playwright.async_api import async_playwright
 
 from schemas import MechanicIntent
+
+# Tracks open Playwright (pw, browser) per bay so we can close on bay clear.
+_open_browsers: dict[str, tuple] = {}
+
+
+def _close_browser_sync(bay_id: str):
+    """Run in a daemon thread: close Playwright browser for the given bay."""
+    entry = _open_browsers.pop(bay_id, None)
+    if not entry:
+        return
+    pw, browser = entry
+    loop = asyncio.new_event_loop()
+    try:
+        async def _do():
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        loop.run_until_complete(_do())
+    finally:
+        loop.close()
+
+
+def cleanup_bay_browser(bay_id: str):
+    """Non-blocking entry point: spawns a thread to close any open browser for this bay."""
+    if bay_id in _open_browsers:
+        threading.Thread(target=_close_browser_sync, args=(bay_id,), daemon=True).start()
 
 SCREEN_WIDTH = 1366
 SCREEN_HEIGHT = 768
@@ -85,52 +117,91 @@ async def execute_action(page, action: dict):
         await asyncio.sleep(0.3)
 
 
-def parse_price(text: str) -> float:
-    """Extract a dollar amount from a string."""
-    m = re.search(r'\$(\d+[,\d]*\.?\d*)', text.replace(',', ''))
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
-    return 0.0
-
-
 async def scrape_cart(page) -> dict:
-    """Scrape product info and total from the AutoZone cart page."""
-    await asyncio.sleep(3)
-    try:
-        body = await page.inner_text("body")
-    except Exception:
-        return {"cart_items": [], "cart_total": 0.0}
+    """Scrape product info and total from the cart page.
+    Tries CSS selectors first; falls back to text parsing."""
+    await asyncio.sleep(2)
 
     cart_items = []
-    lines = [l.strip() for l in body.split("\n") if l.strip()]
-    for i, line in enumerate(lines):
-        if line.startswith("Part #") or line.startswith("Part#"):
-            part_number = line.replace("Part #", "").replace("Part#", "").strip()
-            name = ""
-            for j in range(i - 1, max(0, i - 6), -1):
-                c = lines[j]
-                if len(c) > 8 and not c.startswith("$") and "Pickup" not in c and "Delivery" not in c and "stock" not in c.lower():
-                    name = c
-                    break
-            price = 0.0
-            for j in range(max(0, i - 4), min(len(lines), i + 4)):
-                m = re.search(r"\$(\d+\.?\d*)", lines[j])
-                if m:
-                    price = float(m.group(1))
-                    break
-            if part_number:
-                cart_items.append({"name": name, "part_number": part_number, "price": price})
-
     cart_total = 0.0
-    for line in lines:
-        if "subtotal" in line.lower():
-            m = re.search(r"\$(\d+[,\d]*\.?\d*)", line)
-            if m:
-                cart_total = float(m.group(1).replace(",", ""))
+
+    # Primary: structured selector scan
+    try:
+        for item_sel in [
+            '[data-testid*="cart-item"]', '[class*="cartItem"]',
+            '[class*="cart-line"]', '[class*="cart-product"]', '.cart-item',
+        ]:
+            items_loc = page.locator(item_sel)
+            n = await items_loc.count()
+            if n > 0:
+                for i in range(n):
+                    el = items_loc.nth(i)
+                    txt = (await el.text_content() or "").strip()
+                    pn = re.search(r'Part\s*#?\s*:?\s*([A-Z0-9\-]+)', txt, re.IGNORECASE)
+                    part_number = pn.group(1) if pn else "N/A"
+                    prices = [float(m) for m in re.findall(r'\$(\d+\.\d{2})', txt)
+                              if 0.5 <= float(m) <= 9999]
+                    price = min(prices) if prices else 0.0
+                    lines_clean = [l.strip() for l in txt.split('\n') if len(l.strip()) > 5
+                                   and not l.strip().startswith('$')]
+                    name = lines_clean[0] if lines_clean else ""
+                    cart_items.append({"name": name, "part_number": part_number, "price": price})
                 break
+    except Exception:
+        pass
+
+    # Fallback: text-based parsing (original approach)
+    if not cart_items:
+        try:
+            body = await page.inner_text("body")
+            lines = [l.strip() for l in body.split("\n") if l.strip()]
+            for i, line in enumerate(lines):
+                if line.startswith("Part #") or line.startswith("Part#"):
+                    part_number = line.replace("Part #", "").replace("Part#", "").strip()
+                    name = ""
+                    for j in range(i - 1, max(0, i - 6), -1):
+                        c = lines[j]
+                        if len(c) > 8 and not c.startswith("$") and "Pickup" not in c \
+                                and "Delivery" not in c and "stock" not in c.lower():
+                            name = c
+                            break
+                    price = 0.0
+                    for j in range(max(0, i - 4), min(len(lines), i + 4)):
+                        m = re.search(r"\$(\d+\.?\d*)", lines[j])
+                        if m:
+                            price = float(m.group(1))
+                            break
+                    if part_number:
+                        cart_items.append({"name": name, "part_number": part_number, "price": price})
+        except Exception:
+            pass
+
+    # Cart total — selector first, then text
+    try:
+        for sel in ['[data-testid*="subtotal"]', '[data-testid*="order-total"]',
+                    '[class*="subtotal"]', '[class*="orderTotal"]']:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                text = await el.text_content() or ""
+                m = re.search(r'\$(\d+[,\d]*\.?\d*)', text)
+                if m:
+                    cart_total = float(m.group(1).replace(",", ""))
+                    break
+    except Exception:
+        pass
+
+    if not cart_total:
+        try:
+            body = await page.inner_text("body")
+            for line in body.split("\n"):
+                if "subtotal" in line.lower():
+                    m = re.search(r"\$(\d+[,\d]*\.?\d*)", line)
+                    if m:
+                        cart_total = float(m.group(1).replace(",", ""))
+                        break
+        except Exception:
+            pass
+
     if not cart_total and cart_items:
         cart_total = sum(it["price"] for it in cart_items)
 
@@ -142,13 +213,13 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 VENDOR_SEARCH_URLS = {
     "AutoZone": "https://www.autozone.com/searchresult?searchText={query}",
-    "O'Reilly Auto Parts": "https://www.oreillyauto.com/search?q={query}",
+    "NAPA Auto Parts": "https://www.napaonline.com/en/search?q={query}",
     "Advance Auto Parts": "https://shop.advanceautoparts.com/find/{query}",
 }
 
 VENDOR_CART_URLS = {
     "AutoZone": "https://www.autozone.com/cart",
-    "O'Reilly Auto Parts": "https://www.oreillyauto.com/cart",
+    "NAPA Auto Parts": "https://www.napaonline.com/en/cart",
     "Advance Auto Parts": "https://cart.advanceautoparts.com/web/cart",
 }
 
@@ -235,7 +306,7 @@ async def _scrape_price_from_page(page) -> float:
     return 0.0
 
 
-async def _navigate_to_product(page, url: str, desc: str, vehicle_str: str, vendor: str) -> float:
+async def _navigate_to_product(page, url: str) -> float:
     """Navigate to vendor URL, handle listing pages, return scraped price."""
     try:
         await page.goto(url, timeout=25000)
@@ -275,7 +346,7 @@ async def _navigate_to_product(page, url: str, desc: str, vehicle_str: str, vend
         return 0.0
 
 
-async def _add_to_cart_on_page(page, vendor: str) -> bool:
+async def _add_to_cart_on_page(page) -> bool:
     """Click 'Add to Cart' button on the current product page."""
     cart_selectors = [
         'button:has-text("Add to Cart")',
@@ -301,6 +372,7 @@ async def _playwright_checkout(
     intent: MechanicIntent,
     search_results: dict,
     log_callback: Callable[[str], Awaitable[None]],
+    bay_id: str = "",
 ) -> dict:
     """Open tabs for all vendors, compare real prices, add cheapest to cart."""
 
@@ -310,11 +382,14 @@ async def _playwright_checkout(
 
     await log_callback(f"Opening browser — comparing vendors for {v_str}...")
 
+    _headless = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
-        headless=False,
+        headless=_headless,
         args=["--disable-blink-features=AutomationControlled", "--no-first-run"],
     )
+    if bay_id:
+        _open_browsers[bay_id] = (pw, browser)
     context = await browser.new_context(
         user_agent=UA,
         viewport={"width": 1366, "height": 768},
@@ -353,7 +428,7 @@ async def _playwright_checkout(
             await log_callback(f"  Checking {vname}...")
             pg = await context.new_page()
             desc_pages[vname] = pg
-            price = await _navigate_to_product(pg, url, desc, v_str, vname)
+            price = await _navigate_to_product(pg, url)
             await log_callback(f"    {vname}: ${price:.2f}" if price > 0 else f"    {vname}: price not found")
             if price > 0:
                 prices_found.append({"vendor": vname, "price": price, "page": pg})
@@ -386,7 +461,7 @@ async def _playwright_checkout(
         # Add to cart on the cheapest vendor's tab
         cart_page = cheapest["page"]
         await log_callback(f"  Adding to cart on {cheapest['vendor']}...")
-        added = await _add_to_cart_on_page(cart_page, cheapest["vendor"])
+        added = await _add_to_cart_on_page(cart_page)
 
         if added:
             await log_callback(f"  Added to cart: {desc} from {cheapest['vendor']} at ${cheapest['price']:.2f}")
@@ -403,9 +478,10 @@ async def _playwright_checkout(
             except Exception:
                 pass
 
-    # Navigate to cart and scrape real items/totals to verify what's there
+    # Navigate to each vendor's cart and aggregate items/totals
     await log_callback("\nVerifying cart contents...")
-    cart_data = {"cart_items": [], "cart_total": 0.0}
+    all_cart_items: list[dict] = []
+    all_cart_total = 0.0
 
     for vendor, pg in pages.items():
         cart_url = VENDOR_CART_URLS.get(vendor, "https://www.autozone.com/cart")
@@ -415,11 +491,16 @@ async def _playwright_checkout(
                 await pg.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
-            cart_data = await scrape_cart(pg)
-            await log_callback(f"Cart verified on {vendor}. Browser stays open.")
-            break
+            v_cart = await scrape_cart(pg)
+            all_cart_items.extend(v_cart["cart_items"])
+            all_cart_total += v_cart["cart_total"]
+            await log_callback(
+                f"Cart verified on {vendor}: {len(v_cart['cart_items'])} item(s), ${v_cart['cart_total']:.2f}"
+            )
         except Exception as e:
             await log_callback(f"Cart error on {vendor}: {str(e)[:60]}")
+
+    cart_data = {"cart_items": all_cart_items, "cart_total": all_cart_total}
 
     # Fall back to click-tracking summary if scrape came up empty
     if not cart_data["cart_items"] and cart_results:
@@ -449,6 +530,7 @@ async def run_browser_checkout(
     intent: MechanicIntent,
     search_results: dict,
     log_callback: Callable[[str], Awaitable[None]],
+    bay_id: str = "",
 ) -> dict:
     """Use Claude Computer Use to navigate and add to cart; falls back to Playwright."""
 
@@ -465,11 +547,12 @@ async def run_browser_checkout(
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         await log_callback("ANTHROPIC_API_KEY not set — using Playwright fallback.")
-        return await _playwright_checkout(intent, search_results, log_callback)
+        return await _playwright_checkout(intent, search_results, log_callback, bay_id)
 
+    _headless = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
-        headless=False,
+        headless=_headless,
         args=["--disable-blink-features=AutomationControlled", "--no-first-run"],
     )
     page = await browser.new_page(
@@ -477,6 +560,8 @@ async def run_browser_checkout(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     )
     await page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => false });")
+    if bay_id:
+        _open_browsers[bay_id] = (pw, browser)
 
     # Start at Google
     await page.goto("https://www.google.com", wait_until="domcontentloaded")

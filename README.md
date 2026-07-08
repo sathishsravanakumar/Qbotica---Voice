@@ -1,6 +1,6 @@
 # BayOps AI
 
-Voice-driven parts ordering assistant for auto repair shops. A mechanic speaks from the bay — BayOps AI handles the conversation, searches parts prices across vendors, builds the estimate, and adds items to cart automatically.
+Voice-driven parts ordering assistant for auto repair shops. A mechanic speaks from the bay — BayOps AI handles the conversation, searches parts prices across vendors, verifies fitment, builds the estimate, and adds items to cart automatically.
 
 ---
 
@@ -12,6 +12,7 @@ Voice-driven parts ordering assistant for auto repair shops. A mechanic speaks f
 GROQ_API_KEY=your_groq_key
 ELEVENLABS_API_KEY=your_elevenlabs_key
 ANTHROPIC_API_KEY=your_anthropic_key   # optional — Playwright fallback used if absent
+BROWSER_HEADLESS=false                 # set true to run browser in background
 ```
 
 ### 2. Backend
@@ -41,7 +42,13 @@ Frontend: http://localhost:5173 · Backend: http://localhost:8000
 |---------|--------|
 | Voice input (mic + file upload) | Working |
 | Text chat with AI advisor | Working |
-| Multi-vendor price comparison (AutoZone, O'Reilly, Advance) | Working |
+| Multi-vendor price comparison (AutoZone, NAPA, Advance Auto) | Working |
+| Parallel parts search — all parts searched simultaneously | Working |
+| Search result caching (10-min TTL, avoids repeat DDG hits) | Working |
+| Batched vendor extraction — 1 Groq call per part across all 3 vendors | Working |
+| Price sanity check (rejects hallucinated $0.01 / $9999 prices) | Working |
+| Fitment verification engine (NHTSA + Groq) | Working |
+| Manual price override via chat ("set brake pads to $45") | Working |
 | Playwright browser — adds cheapest part to cart | Working |
 | Cart verification after checkout | Working |
 | Live billing estimate with markup + tax | Working |
@@ -57,7 +64,7 @@ Frontend: http://localhost:5173 · Backend: http://localhost:8000
 
 > "Hey this is Mike in bay 3, I got a 2019 Honda Civic that needs front brake pads and an oil filter"
 
-BayOps will ask for anything missing, search all vendors, show the cheapest price, add to cart, and build the estimate — all in the chat.
+BayOps asks for anything missing, searches all vendors in parallel, verifies fitment, shows prices, adds to cart, and builds the live estimate — all in the chat.
 
 ---
 
@@ -66,8 +73,9 @@ BayOps will ask for anything missing, search all vendors, show the cheapest pric
 - **Frontend** — React 19 + Vite + Tailwind CSS v4
 - **Backend** — Python + FastAPI + WebSockets
 - **AI Chat** — Groq `llama-3.3-70b-versatile`
+- **Fitment Verification** — NHTSA vPIC API + Groq reasoning
 - **Speech-to-Text / TTS** — ElevenLabs
-- **Parts Search** — DuckDuckGo (free, no key)
+- **Parts Search** — DuckDuckGo (free, no key) with session cache
 - **Browser Automation** — Playwright / Claude Computer Use
 - **Excel** — openpyxl (create) + xlwings (live updates)
 
@@ -78,12 +86,14 @@ BayOps will ask for anything missing, search all vendors, show the cheapest pric
 ```
 backend/
   main.py           API server, WebSocket, all endpoints
-  chat_agent.py     Conversational AI (Groq)
-  parts_agent.py    Multi-vendor price search
+  chat_agent.py     Conversational AI (Groq) — collects fields, dispatches actions
+  parts_agent.py    Parallel multi-vendor price search with caching
   billing.py        Markup, labor, tax calculations
-  browser_agent.py  Playwright cart automation
+  browser_agent.py  Playwright cart automation (headless optional)
+  fitment_agent.py  Parts fitment verification (NHTSA + Groq)
   excel_export.py   Excel file creation + live updates
   schemas.py        Pydantic data models
+  utils.py          Shared utilities (parse_price)
   .env              API keys (not committed)
 
 frontend/src/

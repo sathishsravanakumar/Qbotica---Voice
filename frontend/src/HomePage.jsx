@@ -1,10 +1,11 @@
 import { useNavigate } from "react-router-dom";
 import { Mic, Bot, DollarSign, Zap, Clock, ArrowRight, Wrench, Globe, BarChart3, ChevronRight } from "lucide-react";
+import bayLogo from "./bay_logo.png";
 
 const stats = [
-  { value: "20min", label: "Saved Per Repair Order", color: "text-blue-600" },
-  { value: "25%", label: "Revenue Leakage Eliminated", color: "text-emerald-600" },
-  { value: "$39k+", label: "Annual Boost Per Technician", color: "text-purple-600" },
+  { value: "20min", label: "Saved Per Repair Order", color: "text-amber-600" },
+  { value: "25%", label: "Revenue Leakage Eliminated", color: "text-amber-700" },
+  { value: "$39k+", label: "Annual Boost Per Technician", color: "text-amber-500" },
 ];
 
 const features = [
@@ -12,19 +13,19 @@ const features = [
     icon: Mic,
     title: "Hands-Free Voice Input",
     desc: "Technicians dictate from under the car. Our AI parses vehicle, parts, and labor from natural speech.",
-    color: "bg-blue-50 text-blue-600",
+    color: "bg-amber-50 text-amber-600",
   },
   {
     icon: Bot,
     title: "Autonomous Browser Agent",
     desc: "Playwright navigates AutoZone, finds the right part, adds to cart, and shows the checkout page — zero manual clicks.",
-    color: "bg-purple-50 text-purple-600",
+    color: "bg-amber-50 text-amber-600",
   },
   {
     icon: DollarSign,
     title: "Live Billing & Estimates",
     desc: "Parts cost with 45% markup, labor at shop rate, tax — all calculated in real-time per bay. Accumulates across voice commands.",
-    color: "bg-emerald-50 text-emerald-600",
+    color: "bg-amber-50 text-amber-600",
   },
 ];
 
@@ -52,26 +53,26 @@ export default function HomePage() {
     <div className="min-h-screen bg-[#f8fafc]" style={{ fontFamily: "'Inter', sans-serif" }}>
 
       {/* Nav */}
-      <nav className="sticky top-0 z-50 bg-white/80 backdrop-blur-lg border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+      <nav className="sticky top-0 z-50 bg-[#111110] border-b border-[#1E1C18]">
+        <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-blue-500 rounded flex items-center justify-center text-white font-bold text-lg">B</div>
-            <span className="font-bold text-xl tracking-tight text-slate-900">BayOps AI</span>
+            <img src={bayLogo} alt="BayOps AI" className="h-9 w-auto" />
+            <span className="font-bold text-white text-lg">BayOps <span className="text-amber-500">AI</span></span>
           </div>
-          <button
-            onClick={() => navigate("/dashboard")}
-            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-500 hover:bg-blue-600 text-white font-semibold text-sm transition-all cursor-pointer shadow-sm"
-          >
-            Open Dashboard <ArrowRight className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-4">
+            <a href="#how-it-works" className="text-slate-400 hover:text-white text-sm font-medium transition-colors hidden sm:block">How it works</a>
+            <button onClick={() => navigate("/dashboard")} className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg font-semibold text-sm transition-colors cursor-pointer">
+              Open Dashboard
+            </button>
+          </div>
         </div>
       </nav>
 
       {/* Hero */}
-      <section className="max-w-6xl mx-auto px-6 pt-20 pb-16 text-center lg:text-left">
+      <section className="max-w-6xl mx-auto px-6 pt-14 pb-16 text-center lg:text-left">
         <div className="lg:flex lg:items-center lg:gap-16">
           <div className="lg:flex-1">
-            <span className="px-3 py-1 rounded-full bg-blue-100 text-blue-700 text-xs font-bold uppercase tracking-widest">
+            <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-bold uppercase tracking-widest">
               Autonomous Service Advisor
             </span>
             <h1 className="text-4xl lg:text-6xl font-bold mt-5 mb-6 tracking-tight leading-tight text-slate-900">
@@ -84,7 +85,7 @@ export default function HomePage() {
             <div className="flex flex-wrap gap-4 justify-center lg:justify-start">
               <button
                 onClick={() => navigate("/dashboard")}
-                className="flex items-center gap-2 px-8 py-3.5 rounded-xl bg-blue-500 hover:bg-blue-600 text-white font-bold text-base transition-all cursor-pointer shadow-lg shadow-blue-500/25"
+                className="flex items-center gap-2 px-8 py-3.5 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-base transition-all cursor-pointer shadow-lg shadow-amber-600/25"
               >
                 Launch Dashboard <ArrowRight className="w-5 h-5" />
               </button>
@@ -157,8 +158,8 @@ export default function HomePage() {
           <p className="text-slate-500 max-w-2xl mb-12">One voice command triggers the entire pipeline — from parsing to checkout.</p>
           <div className="space-y-4">
             {workflow.map((w, i) => (
-              <div key={i} className="flex items-center gap-6 bg-slate-50 rounded-2xl p-6 border border-slate-200 hover:bg-blue-50 hover:border-blue-200 transition-all group">
-                <div className="w-12 h-12 rounded-xl bg-blue-500 text-white flex items-center justify-center font-bold text-sm shrink-0 group-hover:scale-110 transition-transform">
+              <div key={i} className="flex items-center gap-6 bg-slate-50 rounded-2xl p-6 border border-slate-200 hover:bg-amber-50 hover:border-amber-200 transition-all group">
+                <div className="w-12 h-12 rounded-xl bg-[#111110] text-white flex items-center justify-center font-bold text-sm shrink-0 group-hover:scale-110 transition-transform">
                   {w.step}
                 </div>
                 <w.icon className="w-5 h-5 text-slate-400 shrink-0" />
@@ -193,13 +194,13 @@ export default function HomePage() {
       </section>
 
       {/* CTA */}
-      <section className="bg-blue-500 py-16">
+      <section className="bg-[#111110] py-16">
         <div className="max-w-4xl mx-auto px-6 text-center">
           <h2 className="text-3xl lg:text-4xl font-bold text-white mb-4">Ready to eliminate the bottleneck?</h2>
-          <p className="text-blue-100 text-lg mb-8">Open the dashboard and try a voice command right now.</p>
+          <p className="text-slate-400 text-lg mb-8">Open the dashboard and try a voice command right now.</p>
           <button
             onClick={() => navigate("/dashboard")}
-            className="px-10 py-4 rounded-xl bg-white text-blue-600 font-bold text-base hover:bg-blue-50 transition-all cursor-pointer shadow-xl"
+            className="px-10 py-4 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-base transition-all cursor-pointer shadow-xl shadow-amber-900/40"
           >
             Launch BayOps Dashboard
           </button>
@@ -209,7 +210,7 @@ export default function HomePage() {
       {/* Footer */}
       <footer className="py-8 text-center text-slate-400 text-sm border-t border-slate-200 bg-white">
         <div className="flex items-center justify-center gap-2 mb-2">
-          <div className="w-5 h-5 bg-blue-500 rounded flex items-center justify-center text-white text-[10px] font-bold">B</div>
+          <img src={bayLogo} alt="BayOps AI" className="h-6 w-auto" />
           <span className="font-bold text-slate-600">BayOps AI</span>
         </div>
         &copy; 2026 BayOps Systems. Autonomous service bay workflows.

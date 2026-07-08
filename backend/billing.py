@@ -1,17 +1,5 @@
-import re
 from schemas import LineItem, BillingLineItem, BayBilling, ShopConfig
-
-
-def parse_price(price_str: str) -> float | None:
-    if not price_str:
-        return None
-    match = re.search(r'\$?([\d,]+\.?\d*)', str(price_str).replace(',', ''))
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
+from utils import parse_price
 
 
 def calculate_billing(

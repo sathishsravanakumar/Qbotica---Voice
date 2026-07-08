@@ -27,11 +27,6 @@ class MechanicIntent(BaseModel):
     action: str = Field(description="e.g., 'SOURCE_PARTS'")
 
 
-class VoiceCommandRequest(BaseModel):
-    transcript: str
-    bay_number: Optional[str] = None
-
-
 class AgentStatus(str, Enum):
     IDLE = "IDLE"
     PARSING = "PARSING"
@@ -80,6 +75,13 @@ class ChatRequest(BaseModel):
     bay_number: str = "1"
 
 
+class FitmentResult(BaseModel):
+    status: str = "cleared"  # cleared | warning | halted
+    issues: List[dict] = []
+    clarification_needed: List[str] = []
+    vehicle_details: dict = {}
+
+
 class BayStatus(BaseModel):
     bay_number: str
     status: AgentStatus = AgentStatus.IDLE
@@ -92,3 +94,5 @@ class BayStatus(BaseModel):
     all_results: List[dict] = []
     billing: BayBilling = BayBilling()
     chat_history: List[ChatMessage] = []
+    fitment_override: bool = False
+    pending_browser_intent: Optional[dict] = None

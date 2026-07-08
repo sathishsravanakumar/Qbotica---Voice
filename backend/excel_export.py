@@ -56,7 +56,7 @@ def _vehicle_str(bay_data: dict) -> str:
 
 def _write_static_header(ws):
     """Write rows 1-9 once at file creation. These never change."""
-    for i, w in enumerate([32, 22, 14, 7, 12, 10, 16], 1):
+    for i, w in enumerate([32, 22, 14, 12, 12, 10, 16], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     # Row 1 — blue title banner
@@ -320,6 +320,15 @@ def update_excel_live(file_path: str, bay_data: dict):
                 pass
             row += 1
 
+            # Re-write sub-headers (clear_contents above wiped them)
+            try:
+                ws.range(f"A{row}:D{row}").select()
+                time.sleep(0.08)
+                ws.range(f"A{row}:D{row}").value = ["Description", "Hours", "Rate / Hr", "Total"]
+            except Exception:
+                pass
+            row += 1
+
             for item in labor:
                 vals = [
                     item.get("description", ""),
@@ -327,20 +336,22 @@ def update_excel_live(file_path: str, bay_data: dict):
                     item.get("rate", item.get("unit_cost", 150)),
                     item.get("extended_price", 0.0),
                 ]
-                _safe_print(f"[Excel live] labor row {row} vals={vals}")
                 try:
                     ws.range(f"A{row}:D{row}").select()
                     time.sleep(0.12)
-                    ws.range(f"A{row}:D{row}").value = vals   # explicit 1×4 row
+                    ws.range(f"A{row}:D{row}").value = vals
                     ws.range(f"C{row}").number_format = "$#,##0.00"
                     ws.range(f"D{row}").number_format = "$#,##0.00"
-                except Exception as ex:
-                    _safe_print(f"[Excel live] labor write error at row {row}: {ex}")
+                except Exception:
+                    pass
                 row += 1
 
         row += 1  # blank before totals
 
         # ── 5. Totals ──────────────────────────────────────────────────────────
+        # Write label to A (home cell of merged A:F) and value to G separately.
+        # Writing a list across a merged range in xlwings can silently unmerge
+        # cells, causing label misalignment.
         tax_pct = bay_data.get("tax_rate", 0.0825) * 100
         for label, val in [
             ("Parts Subtotal",        bay_data.get("parts_subtotal", 0.0)),
@@ -349,9 +360,10 @@ def update_excel_live(file_path: str, bay_data: dict):
             ("GRAND TOTAL",           bay_data.get("grand_total", 0.0)),
         ]:
             try:
-                ws.range(f"A{row}:G{row}").select()
+                ws.range(f"A{row}").select()
                 time.sleep(0.12)
-                ws.range(f"A{row}:G{row}").value = [label, None, None, None, None, None, val]
+                ws.range(f"A{row}").value = label
+                ws.range(f"G{row}").value = val
                 ws.range(f"G{row}").number_format = "$#,##0.00"
             except Exception:
                 pass

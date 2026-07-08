@@ -3,6 +3,14 @@ import os
 from groq import AsyncGroq
 from schemas import ChatMessage, BayStatus
 
+_groq_client: AsyncGroq | None = None
+
+def _get_groq_client() -> AsyncGroq:
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
+
 SYSTEM_PROMPT = """You are BayOps AI, a service advisor at an automotive repair shop.
 
 REQUIRED FIELDS — you MUST collect ALL of these before taking any action:
@@ -55,7 +63,8 @@ action meanings:
 - "ADD_LABOR": Add labor hours to the estimate
 - "CHECKOUT": User confirmed, open browser to add to cart
 - "REMOVE_ITEM": Remove an item. Put description in items[0].description.
-- "EDIT_ITEM": Change the quantity of an existing item. Put description in items[0].description, new quantity in items[0].quantity. Use when user says "change X to 2", "update quantity of X", "I need 3 of X instead"."""
+- "EDIT_ITEM": Change the quantity of an existing item. Put description in items[0].description, new quantity in items[0].quantity. Use when user says "change X to 2", "update quantity of X", "I need 3 of X instead".
+- "SET_PRICE": Override the price for a found part. Use when user says "set brake pads to $45", "change the price to $30", "that part costs $X". Put description in items[0].description and the dollar amount in items[0].unit_cost."""
 
 
 def build_bay_context(bay: BayStatus) -> str:
@@ -102,7 +111,7 @@ async def process_chat_message(
     bay: BayStatus,
     user_message: str,
 ) -> dict:
-    client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+    client = _get_groq_client()
 
     bay_context = build_bay_context(bay)
 

@@ -130,6 +130,8 @@ async def recalculate_billing(bay_id: str):
 
 async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
     """Shared pipeline: update bay state, search parts, recalc billing. Returns search results."""
+    from fitment_agent import verify_parts_fitment
+
     bay = bays[bay_id]
 
     if intent.vehicle.year != "N/A" and intent.vehicle.make != "N/A":
@@ -138,17 +140,56 @@ async def execute_intent(intent: MechanicIntent, bay_id: str) -> dict:
         bay.technician_name = intent.technician_name
 
     bay.items = intent.items
-    bay.all_items.extend(intent.items)
+    # Extend all_items, skipping exact duplicates (same type + description)
+    existing = {(it.item_type, it.description.lower()) for it in bay.all_items}
+    for item in intent.items:
+        if (item.item_type, item.description.lower()) not in existing:
+            bay.all_items.append(item)
+            existing.add((item.item_type, item.description.lower()))
 
     has_parts = any(i.item_type == "PART" for i in intent.items)
     search_results = {"results": [], "summary": ""}
 
     if has_parts:
-        bay.logs.append("Searching AutoZone...")
+        part_count = sum(1 for i in intent.items if i.item_type == "PART")
+        bay.logs.append(f"Searching {part_count} part(s) across vendors...")
+        await manager.broadcast({"type": "search_started", "bay": bay_id, "count": part_count})
         search_results = await lookup_parts(intent)
         bay.results = search_results
         if search_results.get("results"):
             bay.all_results.extend(search_results["results"])
+        await manager.broadcast({"type": "search_complete", "bay": bay_id, "results": search_results})
+
+        # Fitment verification gate — runs after search, before browser launch
+        if search_results.get("results") and not bay.fitment_override:
+            bay.logs.append("Verifying fitment...")
+            fitment = await verify_parts_fitment(intent.vehicle, intent.items, search_results)
+
+            if fitment["status"] == "halted":
+                bay.pending_browser_intent = {
+                    "intent": intent.model_dump(),
+                    "search_results": search_results,
+                }
+                await manager.broadcast({
+                    "type": "fitment_warning",
+                    "bay": bay_id,
+                    "halted": True,
+                    "issues": fitment["issues"],
+                    "clarification_needed": fitment["clarification_needed"],
+                })
+                await recalculate_billing(bay_id)
+                _trigger_excel_update(bay_id)
+                return search_results  # exit WITHOUT launching browser
+
+            elif fitment["status"] == "warning":
+                await manager.broadcast({
+                    "type": "fitment_warning",
+                    "bay": bay_id,
+                    "halted": False,
+                    "issues": fitment["issues"],
+                    "clarification_needed": [],
+                })
+                # fall through — browser still launches
 
     await recalculate_billing(bay_id)
     _trigger_excel_update(bay_id)
@@ -179,7 +220,7 @@ async def _browser_work(intent, search_results, bay_id):
 
     try:
         bays[bay_id].status = AgentStatus.BROWSING
-        outcomes = await run_browser_checkout(intent, search_results, log_cb)
+        outcomes = await run_browser_checkout(intent, search_results, log_cb, bay_id)
 
         # Sync real prices scraped from vendor pages back to results
         vendor_prices = outcomes.get("vendor_prices", {})
@@ -234,6 +275,18 @@ async def _browser_work(intent, search_results, bay_id):
         bays[bay_id].billing = calculate_billing(bays[bay_id].all_items, bays[bay_id].all_results, shop_config)
         bays[bay_id].logs.append(f"Billing updated with real prices: ${bays[bay_id].billing.total:.2f}")
         _trigger_excel_update(bay_id)
+
+        # Push real prices and updated billing to the dashboard
+        await manager.broadcast({
+            "type": "billing_update",
+            "bay": bay_id,
+            "billing": bays[bay_id].billing.model_dump(),
+        })
+        await manager.broadcast({
+            "type": "search_complete",
+            "bay": bay_id,
+            "results": bays[bay_id].results,
+        })
 
         bays[bay_id].status = AgentStatus.COMPLETE
         bays[bay_id].results["browser"] = outcomes
@@ -388,7 +441,8 @@ async def chat(req: ChatRequest):
                 if edit_desc:
                     updated = False
                     for it in bay.all_items:
-                        if it.description.lower() == edit_desc or edit_desc in it.description.lower():
+                        stored = it.description.lower()
+                        if stored == edit_desc or edit_desc in stored or stored in edit_desc:
                             it.quantity = new_qty
                             if it.item_type == "LABOR" and it.hours is not None:
                                 it.hours = new_qty
@@ -399,6 +453,28 @@ async def chat(req: ChatRequest):
                         reply = f"Updated to {new_qty:.0f}. Total: ${bay.billing.total:.2f}."
                     else:
                         reply = "Couldn't find that item on the estimate."
+
+            elif action_type == "SET_PRICE":
+                from utils import parse_price_float
+                desc = items_data[0].get("description", "").lower() if items_data else ""
+                new_price = parse_price_float(str(items_data[0].get("unit_cost", 0))) if items_data else 0.0
+                if desc and new_price > 0:
+                    updated = False
+                    for r in bay.all_results:
+                        if r.get("description", "").lower() == desc or desc in r.get("description", "").lower():
+                            r["price"] = f"${new_price:.2f}"
+                            updated = True
+                            break
+                    if bay.results.get("results"):
+                        for r in bay.results["results"]:
+                            if r.get("description", "").lower() == desc or desc in r.get("description", "").lower():
+                                r["price"] = f"${new_price:.2f}"
+                                break
+                    await recalculate_billing(bay_id)
+                    _trigger_excel_update(bay_id)
+                    reply = f"Price updated to ${new_price:.2f}. Total: ${bay.billing.total:.2f}." if updated else "Couldn't find that part on the estimate."
+                else:
+                    reply = "Please specify the part name and new price."
 
             elif action_type == "CHECKOUT":
                 # Fill in missing fields from bay state for MechanicIntent
@@ -411,6 +487,7 @@ async def chat(req: ChatRequest):
 
                 intent = MechanicIntent(**action_data)
                 search_results = bay.results if bay.results.get("results") else {"results": [], "summary": ""}
+                bay.fitment_override = True  # explicit checkout bypasses gate
                 start_browser_thread(intent, search_results, bay_id)
                 bay.logs.append("Browser checkout launched.")
                 reply += f" Opening AutoZone checkout..."
@@ -438,10 +515,14 @@ async def chat(req: ChatRequest):
                     reply += f" Current total: ${bay.billing.total:.2f}."
 
                 # Auto-launch browser to add parts to cart
+                # Skip if fitment engine halted the order (pending_browser_intent is set)
                 has_parts = any(i.item_type == "PART" for i in intent.items)
                 if has_parts and search_results.get("results"):
-                    start_browser_thread(intent, search_results, bay_id)
-                    reply += " Opening AutoZone to add to cart..."
+                    if bay.pending_browser_intent:
+                        reply += " Fitment check flagged an issue — see the warning above."
+                    else:
+                        start_browser_thread(intent, search_results, bay_id)
+                        reply += " Opening AutoZone to add to cart..."
 
             billing_out = bay.billing.model_dump()
             bay.status = AgentStatus.COMPLETE
@@ -590,7 +671,8 @@ async def edit_bay_item(bay_id: str, body: dict):
         raise HTTPException(status_code=400, detail="description required")
     updated = False
     for it in bay.all_items:
-        if it.description.lower() == desc or desc in it.description.lower():
+        stored = it.description.lower()
+        if stored == desc or desc in stored or stored in desc:
             it.quantity = new_qty
             if it.item_type == "LABOR" and it.hours is not None:
                 it.hours = new_qty
@@ -601,9 +683,24 @@ async def edit_bay_item(bay_id: str, body: dict):
     return {"status": "ok", "updated": updated, "billing": bay.billing.model_dump()}
 
 
+@app.post("/api/bays/{bay_id}/override-fitment")
+async def override_fitment(bay_id: str):
+    """User chose to proceed despite fitment warning — launch the pending browser job."""
+    if bay_id not in bays:
+        raise HTTPException(status_code=404, detail="Bay not found")
+    bay = bays[bay_id]
+    bay.fitment_override = True
+    pending = bay.pending_browser_intent
+    if pending:
+        intent = MechanicIntent(**pending["intent"])
+        start_browser_thread(intent, pending["search_results"], bay_id)
+        bay.pending_browser_intent = None
+    return {"status": "ok"}
+
+
 @app.post("/api/bays/{bay_id}/export-excel")
 async def export_bay_to_excel(bay_id: str):
-    from excel_export import export_order_to_excel, open_in_excel
+    from excel_export import export_order_to_excel, open_in_excel, update_excel_live
 
     if bay_id not in bays:
         raise HTTPException(status_code=404, detail="Bay not found")
@@ -613,8 +710,20 @@ async def export_bay_to_excel(bay_id: str):
         raise HTTPException(status_code=400, detail="No billing data to export")
 
     bay_data = _assemble_bay_data(bay)
+    existing_path = excel_files.get(bay_id)
 
-    # Create the .xlsx file
+    if existing_path and os.path.exists(existing_path):
+        # File already created for this bay — update it in place, don't create a new one
+        await asyncio.to_thread(update_excel_live, existing_path, bay_data)
+        filename = os.path.basename(existing_path)
+        await manager.broadcast({
+            "type": "agent_log",
+            "bay": bay_id,
+            "message": f"Order updated in existing file: {filename}",
+        })
+        return {"status": "ok", "file_path": existing_path, "filename": filename}
+
+    # First export for this bay — create the file and open it
     file_path = await asyncio.to_thread(export_order_to_excel, bay_data)
     filename = os.path.basename(file_path)
 
@@ -635,9 +744,11 @@ async def export_bay_to_excel(bay_id: str):
 
 @app.post("/api/bays/{bay_id}/clear")
 async def clear_bay(bay_id: str):
+    from browser_agent import cleanup_bay_browser
     if bay_id in bays:
         bays[bay_id] = BayStatus(bay_number=bay_id)
     excel_files.pop(bay_id, None)   # stop live updates for this bay
+    cleanup_bay_browser(bay_id)     # close any open Playwright window for this bay
     await manager.broadcast({"type": "bay_cleared", "bay": bay_id})
     return {"status": "ok"}
 

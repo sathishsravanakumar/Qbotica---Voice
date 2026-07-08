@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Trash2, Home, ChevronRight, ArrowUpRight, Wrench, Volume2, VolumeX } from "lucide-react";
+import { Trash2, Home, ChevronRight, ArrowUpRight, Wrench, Volume2, VolumeX, Menu, Copy } from "lucide-react";
 import BayCard from "./components/BayCard.jsx";
 import AgentLog from "./components/AgentLog.jsx";
 import BillingPanel from "./components/BillingPanel.jsx";
 import ChatThread from "./components/ChatThread.jsx";
+import bayLogo from "./bay_logo.png";
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws`;
 const API = "/api";
@@ -21,7 +22,13 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState(null);
   const [cartVerification, setCartVerification] = useState(null);
+  const [fitmentWarning, setFitmentWarning] = useState(null);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [searchLoading, setSearchLoading] = useState(0);
+  const [clearConfirm, setClearConfirm] = useState(false);
+  const [logExpanded, setLogExpanded] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [copyDone, setCopyDone] = useState(false);
   const wsRef = useRef(null);
   const mrRef = useRef(null);
   const chunksRef = useRef([]);
@@ -42,12 +49,18 @@ export default function App() {
     const bay = bays[sel];
     if (bay?.chat_history) setChatMessages(bay.chat_history);
     else setChatMessages([]);
+    setSearchLoading(0);
+    setClearConfirm(false);
+    setLogExpanded(false);
+    setSidebarOpen(false);
   }, [sel]);
 
   // WebSocket
   useEffect(() => {
+    let delay = 2000;
     function conn() {
       const w = new WebSocket(WS_URL);
+      w.onopen = () => { delay = 2000; };
       w.onmessage = e => {
         const d = JSON.parse(e.data), id = d.bay;
         setBays(p => {
@@ -57,15 +70,18 @@ export default function App() {
           else if (d.type === "parsed") { u.vehicle = d.intent.vehicle; u.technician_name = d.intent.technician_name; u.items = d.intent.items; }
           else if (d.type === "search_complete") u.results = d.results;
           else if (d.type === "billing_update") u.billing = d.billing;
-          else if (d.type === "bay_cleared") { if (id === sel) { setChatMessages([]); setCartVerification(null); } return { ...p, [id]: { bay_number: id, status: "IDLE", vehicle: null, technician_name: null, items: [], logs: [], results: {}, billing: null, chat_history: [] } }; }
+          else if (d.type === "search_started" && id === sel) { setSearchLoading(d.count || 1); }
+          else if (d.type === "search_complete") { u.results = d.results; if (id === sel) setSearchLoading(0); }
+          else if (d.type === "bay_cleared") { if (id === sel) { setChatMessages([]); setCartVerification(null); setFitmentWarning(null); setSearchLoading(0); setClearConfirm(false); setLogExpanded(false); } return { ...p, [id]: { bay_number: id, status: "IDLE", vehicle: null, technician_name: null, items: [], logs: [], results: {}, billing: null, chat_history: [] } }; }
           else if (d.type === "agent_log") u.logs = [...u.logs, d.message];
           else if (d.type === "agent_complete") { u.status = d.status; u.results = d.results; }
           else if (d.type === "agent_error") { u.status = d.status; u.logs = [...u.logs, d.error]; }
-          else if (d.type === "cart_verified" && id === sel) { setCartVerification(d); }
+          else if (d.type === "cart_verified" && id === sel) { setCartVerification(d); playCartChime(); }
+          else if (d.type === "fitment_warning" && id === sel) { setFitmentWarning(d); }
           return { ...p, [id]: u };
         });
       };
-      w.onclose = () => setTimeout(conn, 2000);
+      w.onclose = () => { setTimeout(conn, delay); delay = Math.min(delay * 2, 30000); };
       wsRef.current = w;
     }
     conn();
@@ -124,7 +140,51 @@ export default function App() {
       setStatus(null);
     } finally {
       setSending(false);
+      setSearchLoading(0);
     }
+  }
+
+  function playCartChime() {
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = "sine";
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.25, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.6);
+      setTimeout(() => ctx.close(), 700);
+    } catch {}
+  }
+
+  function copyEstimate() {
+    const b = bays[sel];
+    if (!b?.billing) return;
+    const { parts_items, labor_items, total, tax_amount, tax_rate } = b.billing;
+    const veh = b.vehicle && b.vehicle.year !== "N/A"
+      ? `${b.vehicle.year} ${b.vehicle.make} ${b.vehicle.model}` : null;
+    const lines = [];
+    if (veh) lines.push(`Vehicle: ${veh}`);
+    if (b.technician_name && b.technician_name !== "Unknown") lines.push(`Technician: ${b.technician_name}`);
+    lines.push("");
+    if (parts_items?.length) {
+      lines.push("PARTS");
+      parts_items.forEach(p => lines.push(`  ${p.description} ×${p.quantity} — $${p.extended_price.toFixed(2)}`));
+    }
+    if (labor_items?.length) {
+      lines.push("LABOR");
+      labor_items.forEach(l => lines.push(`  ${l.description} ${l.quantity.toFixed(1)}h — $${l.extended_price.toFixed(2)}`));
+    }
+    lines.push("");
+    lines.push(`Tax (${(tax_rate * 100).toFixed(1)}%): $${tax_amount.toFixed(2)}`);
+    lines.push(`Total: $${total.toFixed(2)}`);
+    navigator.clipboard.writeText(lines.join("\n")).catch(() => {});
+    setCopyDone(true);
+    setTimeout(() => setCopyDone(false), 2000);
   }
 
   // --- Mic: record → transcribe → auto-send ---
@@ -195,6 +255,13 @@ export default function App() {
     } catch {}
   }
 
+  async function overrideFitment() {
+    try {
+      await fetch(`${API}/bays/${sel}/override-fitment`, { method: "POST" });
+    } catch {}
+    setFitmentWarning(null);
+  }
+
   async function exportToExcel() {
     setExporting(true);
     setExportStatus(null);
@@ -246,27 +313,32 @@ export default function App() {
   return (
     <div className="min-h-screen flex bg-[#f8fafc]">
 
+      {/* Mobile sidebar overlay */}
+      {sidebarOpen && (
+        <div className="fixed inset-0 bg-black/20 z-40 lg:hidden" onClick={() => setSidebarOpen(false)} />
+      )}
+
       {/* Sidebar */}
-      <aside className="fixed left-0 top-0 h-screen w-56 bg-white hidden lg:flex flex-col z-50 border-r border-slate-200">
-        <div className="p-4 pb-3 border-b border-slate-100">
+      <aside className={`fixed left-0 top-0 h-screen w-56 bg-[#111110] flex flex-col z-50 border-r border-[#1E1C18] transition-transform duration-200 ${sidebarOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}>
+        <div className="p-4 pb-3 border-b border-[#1E1C18]">
           <button onClick={() => nav("/")} className="flex items-center gap-2 cursor-pointer group">
-            <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-sm shadow-sm">B</div>
-            <span className="font-bold text-slate-900 text-[15px] group-hover:text-blue-600 transition-colors">BayOps AI</span>
+            <img src={bayLogo} alt="BayOps AI" className="h-7 w-auto" />
+            <span className="font-bold text-white text-[15px] group-hover:text-amber-500 transition-colors">BayOps AI</span>
           </button>
         </div>
         <div className="px-2 pt-2">
-          <button onClick={() => nav("/")} className="flex items-center gap-2 w-full px-3 py-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-50 transition cursor-pointer text-[12px] font-medium">
+          <button onClick={() => nav("/")} className="flex items-center gap-2 w-full px-3 py-1.5 rounded-lg text-slate-500 hover:text-amber-400 hover:bg-white/5 transition cursor-pointer text-[12px] font-medium">
             <Home className="w-3.5 h-3.5" /> Home
           </button>
         </div>
         <div className="px-4 pt-4 pb-1.5">
-          <span className="text-[9px] uppercase tracking-[0.15em] text-slate-400 font-bold">Service Bays</span>
+          <span className="text-[9px] uppercase tracking-[0.15em] text-slate-600 font-bold">Service Bays</span>
         </div>
         <nav className="flex-1 overflow-y-auto px-2 space-y-px">
           {Object.values(bays).map(b => <BayCard key={b.bay_number} bay={b} onSelect={setSel} isSelected={sel === b.bay_number} />)}
         </nav>
-        <div className="p-3 border-t border-slate-100">
-          <div className="flex items-center gap-1.5 text-[11px] text-emerald-600 font-medium">
+        <div className="p-3 border-t border-[#1E1C18]">
+          <div className="flex items-center gap-1.5 text-[11px] text-emerald-500 font-medium">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" /> Online
           </div>
         </div>
@@ -278,8 +350,10 @@ export default function App() {
         <header className="sticky top-0 z-40 bg-white/80 backdrop-blur-xl border-b border-slate-200 px-5 py-2.5">
           <div className="flex items-center justify-between max-w-5xl mx-auto">
             <div className="flex items-center gap-1.5 text-[12px]">
-              <button onClick={() => nav("/")} className="lg:hidden w-7 h-7 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-[10px] cursor-pointer mr-1">B</button>
-              <button onClick={() => nav("/")} className="hidden lg:block text-slate-400 hover:text-blue-500 transition cursor-pointer font-medium">Home</button>
+              <button onClick={() => setSidebarOpen(v => !v)} className="lg:hidden p-1.5 rounded-md text-slate-500 hover:bg-slate-50 cursor-pointer mr-1">
+                <Menu className="w-4 h-4" />
+              </button>
+              <button onClick={() => nav("/")} className="hidden lg:block text-slate-400 hover:text-amber-600 transition cursor-pointer font-medium">Home</button>
               <ChevronRight className="w-3 h-3 text-slate-300" />
               <span className="font-semibold text-slate-900">Bay {sel}</span>
               {veh && <><ChevronRight className="w-3 h-3 text-slate-300" /><span className="text-slate-500">{veh.year} {veh.make} {veh.model}</span></>}
@@ -290,14 +364,24 @@ export default function App() {
               )}
               {hasBill && <span className="text-[12px] font-bold text-emerald-600 mono bg-emerald-50 px-2 py-0.5 rounded-md">${bay.billing.total.toFixed(2)}</span>}
               <button onClick={() => setVoiceOn(v => !v)}
-                className={`p-1.5 rounded-md transition cursor-pointer ${voiceOn ? "text-blue-500 hover:bg-blue-50" : "text-slate-300 hover:bg-slate-50"}`}
+                className={`p-1.5 rounded-md transition cursor-pointer ${voiceOn ? "text-amber-600 hover:bg-amber-50" : "text-slate-300 hover:bg-slate-50"}`}
                 title={voiceOn ? "Mute" : "Unmute"}>
                 {voiceOn ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
               </button>
-              <button onClick={async () => { await fetch(`${API}/bays/${sel}/clear`, { method: "POST" }); }}
-                className="p-1.5 rounded-md text-slate-300 hover:text-red-500 hover:bg-red-50 transition cursor-pointer" title="Clear Bay">
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
+              {clearConfirm ? (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-red-500 font-medium">Clear bay?</span>
+                  <button onClick={async () => { await fetch(`${API}/bays/${sel}/clear`, { method: "POST" }); setClearConfirm(false); }}
+                    className="px-2 py-0.5 text-[10px] font-semibold bg-red-500 text-white rounded cursor-pointer hover:bg-red-600 transition">Yes</button>
+                  <button onClick={() => setClearConfirm(false)}
+                    className="px-2 py-0.5 text-[10px] text-slate-500 border border-slate-200 rounded cursor-pointer hover:bg-slate-50 transition">No</button>
+                </div>
+              ) : (
+                <button onClick={() => setClearConfirm(true)}
+                  className="p-1.5 rounded-md text-slate-300 hover:text-red-500 hover:bg-red-50 transition cursor-pointer" title="Clear Bay">
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </header>
@@ -318,6 +402,16 @@ export default function App() {
             />
           </div>
 
+          {/* Search loading card */}
+          {searchLoading > 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm px-5 py-4 flex items-center gap-3 animate-fade">
+              <div className="w-4 h-4 border-2 border-amber-500 border-t-transparent rounded-full animate-spin shrink-0" />
+              <span className="text-[13px] text-slate-500">
+                Searching AutoZone, NAPA &amp; Advance Auto for {searchLoading} part{searchLoading > 1 ? "s" : ""}…
+              </span>
+            </div>
+          )}
+
           {/* Results + Billing */}
           {(bay.results?.results?.length > 0 || hasBill) && (
             <div className="grid lg:grid-cols-2 gap-4 animate-fade">
@@ -330,8 +424,11 @@ export default function App() {
                   <div className="divide-y divide-slate-100">
                     {bay.results.results.map((p, i) => (
                       <div key={i} className="px-4 py-3">
-                        {/* Part description */}
-                        <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-2 capitalize">{p.description}</p>
+                        {/* Part description + product name */}
+                        <p className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-0.5 capitalize">{p.description}</p>
+                        {p.product_name && p.product_name !== p.description && (
+                          <p className="text-[10px] text-slate-400 mb-1.5 truncate">{p.product_name}</p>
+                        )}
                         {/* Vendor comparison rows */}
                         <div className="space-y-1">
                           {(p.vendor_options?.length > 0 ? p.vendor_options : [{
@@ -339,7 +436,6 @@ export default function App() {
                             source_url: p.source_url, in_stock: p.in_stock, part_number: p.part_number,
                           }]).map((opt, vi) => {
                             const isSelected = opt.vendor === p.vendor;
-                            const [switching, setSwitching] = [false, () => {}];
                             return (
                               <button
                                 key={vi}
@@ -355,14 +451,14 @@ export default function App() {
                                 }}
                                 className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-left transition-all cursor-pointer
                                   ${isSelected
-                                    ? "bg-blue-50 border border-blue-200"
+                                    ? "bg-amber-50 border border-amber-200"
                                     : "border border-transparent hover:bg-slate-50 hover:border-slate-200"
                                   }`}
                               >
                                 <div className="flex items-center gap-2 min-w-0 flex-1">
-                                  {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-blue-500 shrink-0" />}
+                                  {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-amber-600 shrink-0" />}
                                   {!isSelected && <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />}
-                                  <span className={`text-[12px] font-medium truncate ${isSelected ? "text-blue-700" : "text-slate-600"}`}>
+                                  <span className={`text-[12px] font-medium truncate ${isSelected ? "text-amber-700" : "text-slate-600"}`}>
                                     {opt.vendor}
                                   </span>
                                   <span className={`text-[9px] font-bold uppercase px-1 py-0.5 rounded shrink-0 ${opt.in_stock ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-500"}`}>
@@ -370,7 +466,7 @@ export default function App() {
                                   </span>
                                 </div>
                                 <div className="flex items-center gap-2 shrink-0">
-                                  <span className={`font-bold text-[13px] ${isSelected ? "text-blue-700" : "text-slate-700"}`}>
+                                  <span className={`font-bold text-[13px] ${isSelected ? "text-amber-700" : "text-slate-700"}`}>
                                     {String(opt.price).startsWith("$") ? opt.price : opt.price === "See website" ? "—" : `$${opt.price}`}
                                   </span>
                                   {opt.source_url && (
@@ -413,6 +509,13 @@ export default function App() {
                       {exportStatus}
                     </p>
                   )}
+                  <button
+                    onClick={copyEstimate}
+                    className="w-full py-2 px-4 bg-white hover:bg-slate-50 text-slate-600 text-[13px] font-medium rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-2 border border-slate-200"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    {copyDone ? "Copied!" : "Copy Estimate"}
+                  </button>
                 </div>
               )}
             </div>
@@ -420,8 +523,56 @@ export default function App() {
 
           {/* Terminal */}
           {bay.logs?.length > 0 && (
-            <div className="h-[180px]">
-              <AgentLog logs={bay.logs} bayNumber={sel} />
+            <div className={logExpanded ? "h-[400px]" : "h-[180px]"} style={{ transition: "height 0.2s ease" }}>
+              <AgentLog logs={bay.logs} bayNumber={sel} expanded={logExpanded} onToggleExpand={() => setLogExpanded(v => !v)} />
+            </div>
+          )}
+
+          {/* Fitment Warning */}
+          {fitmentWarning && fitmentWarning.bay === sel && (
+            <div className={`rounded-xl border px-4 py-3 text-[13px] animate-fade ${
+              fitmentWarning.halted
+                ? "bg-red-50 border-red-200 text-red-800"
+                : "bg-amber-50 border-amber-200 text-amber-800"
+            }`}>
+              <div className="flex items-center justify-between">
+                <span className="font-semibold">
+                  {fitmentWarning.halted
+                    ? "⛔ Order halted — fitment issue detected"
+                    : "⚠ Fitment advisory — order is proceeding"}
+                </span>
+                <button onClick={() => setFitmentWarning(null)} className="ml-4 text-[10px] opacity-50 hover:opacity-100 cursor-pointer">✕</button>
+              </div>
+              {fitmentWarning.issues?.length > 0 && (
+                <ul className="mt-2 space-y-0.5 text-[11px] opacity-80">
+                  {fitmentWarning.issues.map((iss, i) => (
+                    <li key={i}><span className="font-medium">{iss.part}</span>: {iss.issue}</li>
+                  ))}
+                </ul>
+              )}
+              {fitmentWarning.clarification_needed?.length > 0 && (
+                <div className="mt-2 text-[11px] font-medium space-y-0.5">
+                  {fitmentWarning.clarification_needed.map((q, i) => (
+                    <p key={i}>→ {q}</p>
+                  ))}
+                </div>
+              )}
+              {fitmentWarning.halted && (
+                <div className="mt-3 flex gap-2">
+                  <button
+                    onClick={overrideFitment}
+                    className="px-3 py-1 text-[11px] font-semibold bg-red-600 text-white rounded-lg hover:bg-red-700 transition cursor-pointer"
+                  >
+                    Proceed Anyway
+                  </button>
+                  <button
+                    onClick={() => setFitmentWarning(null)}
+                    className="px-3 py-1 text-[11px] text-red-700 border border-red-200 rounded-lg hover:bg-red-100 transition cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
